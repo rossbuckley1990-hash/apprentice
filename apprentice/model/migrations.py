@@ -61,6 +61,32 @@ MIGRATIONS: List[Tuple[str, str]] = [
             PRIMARY KEY (qualified_name, snapshot_at)
         );
     """),
+    ("0.3.0", """
+        -- Structured call data on functions (replaces ast_summary regex).
+        -- JSON array of raw call names from the AST.
+        ALTER TABLE functions ADD COLUMN calls TEXT NOT NULL DEFAULT '[]';
+    """),
+    ("0.3.1", """
+        -- Recreate function_history WITHOUT the foreign key constraint.
+        -- History should survive function deletion (so we can track complexity
+        -- trends even after a function is renamed/deleted). The original FK
+        -- prevented this — deleting a function would fail if history existed.
+        CREATE TABLE IF NOT EXISTS function_history_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            qualified_name TEXT NOT NULL,
+            snapshot_at TEXT NOT NULL,
+            complexity INTEGER NOT NULL,
+            line_count INTEGER NOT NULL,
+            caller_count INTEGER NOT NULL,
+            body_hash TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO function_history_new
+            SELECT * FROM function_history;
+        DROP TABLE IF EXISTS function_history;
+        ALTER TABLE function_history_new RENAME TO function_history;
+        CREATE INDEX IF NOT EXISTS idx_fh_fn ON function_history(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_fh_time ON function_history(snapshot_at);
+    """),
 ]
 
 
@@ -96,11 +122,21 @@ def migrate(conn: sqlite3.Connection) -> List[str]:
         if version <= current:
             continue
         # Only run if there's actual SQL (not just comments/whitespace)
-        # Strip comments and whitespace to check
         import re
         sql_no_comments = re.sub(r'--.*$', '', sql, flags=re.MULTILINE).strip()
         if sql_no_comments:
-            conn.executescript(sql)
+            # ALTER TABLE statements can fail if the column already exists.
+            # Split into statements and run each, tolerating "duplicate column"
+            # errors so re-running migrations is idempotent.
+            statements = [s.strip() for s in sql_no_comments.split(';') if s.strip()]
+            for stmt in statements:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" in str(e).lower():
+                        pass  # column already exists — idempotent
+                    else:
+                        raise
         set_schema_version(conn, version)
         applied.append(version)
     return applied

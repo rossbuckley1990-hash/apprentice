@@ -31,34 +31,53 @@ from ..model.store import Store
 # =============================================================================
 
 def _norm_ast(node: ast.AST) -> str:
-    """Canonical string form of an AST, ignoring docstrings, comments, names of
-    private locals. Used for body_hash (duplication detection)."""
-    # Strip docstrings (Expr nodes whose value is a constant string at the start)
-    class DocStripper(ast.NodeTransformer):
-        def visit_Expr(self, node):
-            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                return None
-            return node
-        def visit_Name(self, node):
-            # Normalize non-public names to a placeholder so two functions
-            # with the same structure but different local variable names
-            # hash to the same body.
-            if node.id.startswith("_"):
-                return ast.copy_location(
-                    ast.Name(id="_local", ctx=node.ctx), node
-                )
-            return node
-        def visit_arg(self, node):
-            # Keep arg names — they're part of the signature, not the body
-            return node
+    """Canonical string form of an AST, ignoring docstrings and normalizing
+    local variable names. Used for body_hash (duplication detection).
 
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        # Take only the body, strip docstring, normalize
-        body = [DocStripper().visit(stmt) for stmt in node.body]
-        body = [b for b in body if b is not None]
-        # Use ast.dump on the body to get a canonical form
-        return ast.dump(ast.Module(body=body, type_ignores=[]))
-    return ast.dump(node)
+    IMPORTANT: deep-copies the node before transforming, so the original AST
+    is not mutated. (Previous version mutated in place, corrupting the
+    ast_summary and call graph computed downstream.)
+    """
+    import copy
+
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return ast.dump(node)
+
+    # Deep-copy so we don't mutate the original tree
+    node_copy = copy.deepcopy(node)
+
+    # Strip ONLY the leading docstring (first stmt if it's a bare string constant)
+    body = list(node_copy.body)
+    if (body and isinstance(body[0], ast.Expr) and
+            isinstance(body[0].value, ast.Constant) and
+            isinstance(body[0].value.value, str)):
+        body = body[1:]
+
+    # Normalize local variable names: any Name that is loaded/stored but is NOT
+    # a function argument and is not a global/builtin gets renamed to _local_N.
+    # We collect arg names first so we don't rename them.
+    arg_names: set = set()
+    for arg in node_copy.args.args:
+        arg_names.add(arg.arg)
+    if node_copy.args.vararg:
+        arg_names.add(node_copy.args.vararg.arg)
+    if node_copy.args.kwarg:
+        arg_names.add(node_copy.args.kwarg.arg)
+
+    # Walk and normalize. We rename ALL Name nodes to _local (losing the
+    # distinction between different locals) — this is intentionally aggressive
+    # for duplication detection: two functions with the same structure but
+    # different variable names should hash the same.
+    class NameNormalizer(ast.NodeTransformer):
+        def visit_Name(self, n):
+            if n.id in arg_names:
+                return n  # keep arg names
+            if n.id.startswith("__") and n.id.endswith("__"):
+                return n  # keep dunder names (language primitives)
+            return ast.copy_location(ast.Name(id="_local", ctx=n.ctx), n)
+
+    body = [NameNormalizer().visit(stmt) for stmt in body]
+    return ast.dump(ast.Module(body=body, type_ignores=[]))
 
 
 def _signature_hash(name: str, arg_names: List[str]) -> str:
@@ -151,45 +170,157 @@ def _complexity(func_node: ast.FunctionDef) -> int:
 # =============================================================================
 
 def _collect_calls(func_node: ast.FunctionDef) -> List[str]:
-    """Names of functions called inside this function (best-effort, unresolved)."""
-    called_names: List[str] = []
+    """Collect all call targets from the function body, structured for the
+    call graph. Returns a list of call descriptors:
+
+      - 'foo'           : a direct call to a name 'foo' (resolved by name lookup)
+      - '.method'       : a method call on some object (resolved by class context)
+      - 'Class.method'  : a qualified call (resolved by class lookup)
+      - 'module.func'   : a dotted call (best-effort, often unresolvable)
+
+    The call graph builder (_build_call_graph) resolves these to qualified names.
+    """
+    calls: List[str] = []
+    seen = set()
     for node in ast.walk(func_node):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                called_names.append(node.func.id)
-            elif isinstance(node.func, ast.Attribute):
-                # method call — we can't fully resolve without type info
-                # but we record the attribute name as a hint
-                called_names.append(f".{node.func.attr}")
-    return list(dict.fromkeys(called_names))
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            # Direct call: foo()
+            name = func.id
+            if name not in seen:
+                seen.add(name)
+                calls.append(name)
+        elif isinstance(func, ast.Attribute):
+            # Method or dotted call: obj.method() or module.func()
+            attr = func.attr
+            if isinstance(func.value, ast.Name):
+                # obj.method() — record as '.method' for within-class resolution
+                # Also record the receiver variable name for type inference
+                receiver = func.value.id
+                call_desc = f".{attr}"
+                if call_desc not in seen:
+                    seen.add(call_desc)
+                    calls.append(call_desc)
+                # If the receiver is 'self', this is a method call within the class
+                if receiver == "self":
+                    self_call = f"self.{attr}"
+                    if self_call not in seen:
+                        seen.add(self_call)
+                        calls.append(self_call)
+            elif isinstance(func.value, ast.Attribute):
+                # module.Class.method() — record as 'Class.method'
+                if isinstance(func.value.value, ast.Name):
+                    qualified = f"{func.value.value.id}.{func.value.attr}.{attr}"
+                    if qualified not in seen:
+                        seen.add(qualified)
+                        calls.append(qualified)
+                else:
+                    call_desc = f".{attr}"
+                    if call_desc not in seen:
+                        seen.add(call_desc)
+                        calls.append(call_desc)
+            else:
+                # Complex receiver: (expr).method()
+                call_desc = f".{attr}"
+                if call_desc not in seen:
+                    seen.add(call_desc)
+                    calls.append(call_desc)
+    return calls
 
 
 def _build_call_graph(functions: List[Function]) -> Dict[str, List[str]]:
-    """Given a list of Function entities (with .ast_summary containing 'calls X'),
-    resolve callers for each.
+    """Build the caller map from structured call data.
+
+    Uses the `calls` field on each Function (populated from the AST by
+    _collect_calls). Resolves:
+      - Direct calls ('foo') by name → qualified name lookup
+      - self.method calls by class context → Class.method
+      - .method calls by best-effort class context (if the function is a method,
+        try resolving .method against sibling methods in the same class)
 
     Returns: qualified_name -> list of qualified_names that call it.
     """
-    # Build name -> qualified_name index (handles simple cases)
+    # Build name -> qualified_name index (handles direct calls)
     name_to_qualified: Dict[str, List[str]] = {}
+    # Build method_name -> list of qualified names (handles method calls)
+    # e.g. 'method' -> ['module.Class1.method', 'module.Class2.method']
+    method_to_qualified: Dict[str, List[str]] = {}
+    # Build class_name -> set of method qualified_names (for self.method resolution)
+    class_methods: Dict[str, List[str]] = {}
+
     for fn in functions:
         name_to_qualified.setdefault(fn.name, []).append(fn.qualified_name)
+        # If this function is a method (qualified_name has 3+ parts), index it
+        parts = fn.qualified_name.rsplit(".", 2)
+        if len(parts) >= 2:
+            # Could be module.Class.method or Class.method
+            method_name = fn.name
+            method_to_qualified.setdefault(method_name, []).append(fn.qualified_name)
+            if len(parts) >= 3:
+                class_name = parts[-2]
+                class_methods.setdefault(class_name, []).append(fn.qualified_name)
 
     callers: Dict[str, List[str]] = {fn.qualified_name: [] for fn in functions}
 
     for fn in functions:
-        # Parse the ast_summary for "calls X, Y"
-        m = re.search(r"calls ([^;]+)", fn.ast_summary)
-        if not m:
-            continue
-        called_str = m.group(1)
-        for called_name in [c.strip() for c in called_str.split(",")]:
-            # Direct function name
-            if called_name in name_to_qualified:
-                for target_qn in name_to_qualified[called_name]:
-                    if target_qn != fn.qualified_name:
-                        callers.setdefault(target_qn, []).append(fn.qualified_name)
-            # Method call like "*.foo" or ".foo" — skip for now (no type info)
+        # Determine the class context of this function (if it's a method)
+        fn_parts = fn.qualified_name.rsplit(".", 2)
+        fn_class = None
+        if len(fn_parts) >= 3:
+            fn_class = fn_parts[-2]
+
+        for call_desc in fn.calls:
+            target_qualified = None
+
+            if call_desc.startswith("self."):
+                # self.method() — resolve within the same class
+                method_name = call_desc[5:]
+                if fn_class and fn_class in class_methods:
+                    for qn in class_methods[fn_class]:
+                        if qn.rsplit(".", 1)[-1] == method_name:
+                            target_qualified = qn
+                            break
+
+            elif call_desc.startswith("."):
+                # .method() — try within-class first, then global
+                method_name = call_desc[1:]
+                if fn_class and fn_class in class_methods:
+                    for qn in class_methods[fn_class]:
+                        if qn.rsplit(".", 1)[-1] == method_name:
+                            target_qualified = qn
+                            break
+                if target_qualified is None:
+                    # Fall back to global method lookup
+                    candidates = method_to_qualified.get(method_name, [])
+                    if len(candidates) == 1:
+                        target_qualified = candidates[0]
+                    # If multiple, we can't resolve without type info — skip
+
+            elif "." in call_desc:
+                # Class.method or module.func — try direct qualified lookup
+                if call_desc in name_to_qualified:
+                    target_qualified = call_desc
+                else:
+                    # Try suffix match: 'Class.method' might match 'module.Class.method'
+                    for qn_list in [name_to_qualified.get(call_desc.split(".")[-1], [])]:
+                        for qn in qn_list:
+                            if qn.endswith(call_desc):
+                                target_qualified = qn
+                                break
+
+            else:
+                # Direct call: foo()
+                candidates = name_to_qualified.get(call_desc, [])
+                if len(candidates) == 1:
+                    target_qualified = candidates[0]
+                elif len(candidates) > 1:
+                    # Ambiguous — skip (can't resolve without module context)
+                    pass
+
+            if target_qualified and target_qualified != fn.qualified_name:
+                callers.setdefault(target_qualified, []).append(fn.qualified_name)
 
     # Dedupe
     for k in callers:
@@ -365,6 +496,7 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
             body_h = _body_hash(node)
             summary = _ast_summary(node)
             cx = _complexity(node)
+            calls = _collect_calls(node)
 
             end_line = getattr(node, "end_lineno", node.lineno)
 
@@ -376,6 +508,7 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
                 signature_hash=sig_hash, body_hash=body_h,
                 ast_summary=summary, complexity=cx,
                 docstring=docstring,
+                calls=calls,
             ))
 
             # Don't recurse into function bodies for nested defs to keep it simple
@@ -393,11 +526,27 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
 
 def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Dict[str, int]:
     """Index all supported files in the repo. Updates the store incrementally.
-    Uses the language registry to find the right parser for each file."""
+    Uses the language registry to find the right parser for each file.
+
+    Stale-row cleanup: when a file changes, its old function/class rows are
+    deleted before inserting new ones. Files no longer on disk are removed
+    entirely (including their embeddings).
+    """
     from .registry import get_parser_for_file, supported_extensions
 
-    # Discover all supported files
-    files = discover_all_files(root, config)
+    # Discover all supported files currently on disk
+    files_on_disk = set(discover_all_files(root, config))
+
+    # Clean up files that are in the store but no longer on disk
+    stored_files = store.all_files()
+    n_deleted = 0
+    for f in stored_files:
+        if f.path not in files_on_disk:
+            store.delete_file(f.path)
+            n_deleted += 1
+    if verbose and n_deleted > 0:
+        print(f"  removed {n_deleted} deleted file(s) from the model")
+
     n_files = 0
     n_functions = 0
     n_classes = 0
@@ -405,7 +554,7 @@ def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Di
 
     all_functions: List[Function] = []
 
-    for rel_path in files:
+    for rel_path in sorted(files_on_disk):
         abs_path = os.path.join(root, rel_path)
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
@@ -420,6 +569,11 @@ def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Di
             all_functions.extend(store.functions_in_file(rel_path))
             n_files += 1
             continue
+
+        # File changed (or is new) — delete stale rows before inserting
+        if existing:
+            store.delete_functions_in_file(rel_path)
+            store.delete_classes_in_file(rel_path)
 
         # Find the right parser
         parser = get_parser_for_file(rel_path)
@@ -448,7 +602,7 @@ def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Di
         n_changed += 1
 
         if verbose and n_changed % 20 == 0:
-            print(f"  indexed {n_files}/{len(files)} files...")
+            print(f"  indexed {n_files}/{len(files_on_disk)} files...")
 
     # Build call graph and update callers
     if verbose:

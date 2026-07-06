@@ -15,22 +15,19 @@ For 35 years this was a research vision. The AI didn't exist. Now it does.
 
 | Tool | Persistent model? | Proactive? | Plan-aware? | Cliché-aware? | LLM synthesis? |
 |---|---|---|---|---|---|
-| GitHub Copilot | ❌ | ❌ | ❌ | ❌ | ✓ |
-| Cursor | partial | partial (PR) | ❌ | ❌ | ✓ |
-| Devin | ❌ | partial | ❌ | ❌ | ✓ |
-| Claude Code | partial | ❌ | ❌ | ❌ | ✓ |
-| **Apprentice** | **✓** | **✓** | **✓** | **✓** | **✓** |
+| GitHub Copilot | partial (rules) | ❌ | ❌ | ❌ | ✓ |
+| Cursor | partial (rules) | partial (PR) | ❌ | ❌ | ✓ |
+| Devin | ❌ (per-task) | partial (incidents) | ❌ | ❌ | ✓ |
+| Claude Code | partial (sleep) | ❌ | ❌ | ❌ | ✓ |
+| **Apprentice** | **✓ (SQLite)** | **✓** | **✓** | **✓** | **✓** |
 
-Copilot, Cursor, and Devin are **stateless prompt-response tools**. They forget
-everything between sessions. They only respond when asked. They don't know what
-you're trying to do. They don't notice when you repeat yourself.
-
-The Apprentice is the opposite:
-- **Persistent** — maintains a living model of your codebase in SQLite. Remembers across sessions.
-- **Proactive** — runs `apprentice watch` and flags issues *without being asked*.
-- **Plan-aware** — you state an intent; the Apprentice checks new code against it.
-- **Cliché-aware** — detects when you've written the same function twice.
-- **LLM-powered** — natural-language Q&A, fix synthesis, function summarization.
+Most coding tools maintain *some* workspace context (Copilot rules, Cursor
+memories, Claude Code's CLAUDE.md). The Apprentice's difference is a
+**structured, queryable model** — not just rules or notes, but a typed graph
+of functions, call edges, clichés, and plans — plus **proactive analysis**
+that runs without being asked. The dead-code and duplication analyzers use
+an AST-based call graph (not regex) and deterministic observation IDs for
+deduplication.
 
 ## Install
 
@@ -208,8 +205,8 @@ and register it in `registry.py`.
 
 - [x] Persistent codebase model (SQLite)
 - [x] Python AST indexer
-- [x] Six proactive analyzers
-- [x] Pluggable embeddings (offline default)
+- [x] Seven proactive analyzers (AST-based call graph, deterministic IDs)
+- [x] Pluggable embeddings (offline default: hashed-TF)
 - [x] Plan tracking + drift detection
 - [x] CLI
 - [x] **LLM integration** (ask, fix, summarize)
@@ -221,10 +218,12 @@ and register it in `registry.py`.
 - [x] **Rich CLI** (colors, formatting)
 - [x] **Schema migrations** (versioned, forward-only)
 - [x] **CI/CD** (GitHub Actions)
+- [x] **Self-hosting tests** (index own repo, verify analyzers don't false-positive)
 - [ ] `apprentice fix --apply` (auto-apply patches)
 - [ ] VS Code extension
 - [ ] Tree-sitter for JS/TS (replacing regex)
 - [ ] Semantic drift detection (embedding-based)
+- [ ] Real IDF computation (currently hashed-TF, not full TF-IDF)
 - [ ] Sleep-time consolidation (forward-looking, like Claude Code's Auto Dream but proactive)
 
 ## Why now

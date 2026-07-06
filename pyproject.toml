@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apprentice"
-version = "0.2.0"
+version = "0.3.1"
 description = "The Programmer's Apprentice — a persistent, proactive coding agent (Rich & Waters 1988)"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -115,11 +115,14 @@ class TestIndexer:
         store = init_store(tmp_repo)
         index_repo(tmp_repo, store, verbose=False)
         fns = {f.name: f for f in store.all_functions()}
-        assert fns["used_fn"].is_dead is False  # has a caller
+        # used_fn is called by caller() — NOT dead
+        assert fns["used_fn"].is_dead is False
+        # unused_fn has no callers — dead
         assert fns["unused_fn"].is_dead is True
-        assert fns["caller"].is_dead is True  # no callers, but not entry point or test
-        # Actually 'caller' is not a dunder/test/entry — so it's also dead
-        # But we may want to be smarter. For now this is correct behavior.
+        # caller has no callers — also dead (correctly; nothing calls it).
+        # The tool can't know if 'caller' is an entry point unless it's
+        # named 'main' or starts with 'test_'.
+        assert fns["caller"].is_dead is True
 
     def test_duplication_detection(self, tmp_repo):
         write_file(tmp_repo, "dup.py", """
@@ -137,7 +140,8 @@ class TestIndexer:
         assert len(cliches) == 1
         assert len(cliches[0].instances) == 2
 
-    def test_call_graph(self, tmp_repo):
+    def test_call_graph_direct_calls(self, tmp_repo):
+        """Verify the call graph correctly resolves direct function calls."""
         write_file(tmp_repo, "calls.py", """
             def foo():
                 return bar() + baz()
@@ -149,8 +153,42 @@ class TestIndexer:
         store = init_store(tmp_repo)
         index_repo(tmp_repo, store, verbose=False)
         fns = {f.name: f for f in store.all_functions()}
-        assert "calls.foo" in fns["bar"].callers or "foo" in str(fns["bar"].callers)
-        assert "calls.foo" in fns["baz"].callers or "foo" in str(fns["baz"].callers)
+        # foo calls bar and baz, so bar and baz should have foo as a caller
+        foo_qname = fns["foo"].qualified_name
+        assert foo_qname in fns["bar"].callers, (
+            f"bar.callers = {fns['bar'].callers}, expected to include {foo_qname}"
+        )
+        assert foo_qname in fns["baz"].callers, (
+            f"baz.callers = {fns['baz'].callers}, expected to include {foo_qname}"
+        )
+        # bar and baz should NOT be dead (foo calls them)
+        assert fns["bar"].is_dead is False
+        assert fns["baz"].is_dead is False
+
+    def test_call_graph_self_method_calls(self, tmp_repo):
+        """Verify that self.method() calls within a class are resolved."""
+        write_file(tmp_repo, "cls.py", """
+            class Calculator:
+                def add(self, x, y):
+                    return self.validate(x) + self.validate(y)
+                def validate(self, x):
+                    if x < 0:
+                        raise ValueError
+                    return x
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        fns = {f.name: f for f in store.all_functions()}
+        # Calculator.add calls self.validate, so validate should have add as a caller
+        add_qname = fns["add"].qualified_name
+        assert add_qname in fns["validate"].callers, (
+            f"validate.callers = {fns['validate'].callers}, "
+            f"expected to include {add_qname}"
+        )
+        # validate should NOT be dead
+        assert not fns["validate"].is_dead, (
+            "validate is flagged as dead — self.method() call resolution is broken"
+        )
 
 
 # =============================================================================

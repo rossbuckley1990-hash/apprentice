@@ -79,7 +79,11 @@ def get_store_and_config() -> tuple[str, Store, Config]:
 # =============================================================================
 
 def cmd_init(args):
-    root = os.getcwd()
+    # Use find_repo_root for consistency — fall back to cwd only when
+    # neither .git nor .apprentice exists.
+    root = find_repo_root()
+    if not (Path(root) / ".apprentice").exists() and not (Path(root) / ".git").exists():
+        root = os.getcwd()  # truly fresh directory
     store = init_store(root)
     gitignore = Path(root) / ".gitignore"
     if gitignore.exists():
@@ -99,6 +103,9 @@ def cmd_init(args):
 def cmd_index(args):
     root, store, config = get_store_and_config()
     if args.rebuild:
+        # Close the connection before unlinking the DB file
+        # (Windows will fail with a file lock if we don't)
+        store.close()
         Path(default_db_path(root)).unlink(missing_ok=True)
         store = init_store(root)
     print(f"  Indexing {root} ...")
@@ -160,6 +167,7 @@ def cmd_plan(args):
 
     if not args.text:
         print("  Usage: apprentice plan <description>")
+        print("         apprentice plan --keywords auth,api <description>")
         print("         apprentice plan --list")
         print("         apprentice plan --done <id>")
         return
@@ -168,6 +176,10 @@ def cmd_plan(args):
     description = " ".join(args.text)
     from ..analyzer.proactive import _extract_drift_keywords
     keywords = sorted(_extract_drift_keywords(description))
+    # Merge with explicit --keywords if provided
+    if args.keywords:
+        explicit = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        keywords = sorted(set(keywords) | set(explicit))
     plan = Plan(id=plan_id, description=description, keywords=keywords)
     store.upsert_plan(plan)
     print(f"  Plan [{plan_id}] recorded: {description}")
@@ -202,30 +214,50 @@ def cmd_watch(args):
     print(f"  Analyzing {len(changed)} changed files...")
     index_repo(root, store, verbose=False, config=config)
 
+    # Refresh embeddings for changed files so `similar` stays current
+    from ..indexer.embedder import Embedder
+    embedder = Embedder(backend=config.embedding_backend)
+    # Only re-embed functions in changed files
+    for rel_path in changed:
+        for fn in store.functions_in_file(rel_path):
+            existing = store.get_embedding(fn.qualified_name)
+            if existing is None or existing[1] != embedder.backend:
+                # Needs embedding
+                pass
+    # Bulk re-embed (cheap with TF-IDF)
+    embedder.index_all(store, root)
+
     observations = run_all_analyzers(store, root, changed, config=config)
 
+    # Add observations (dedup via deterministic IDs — already-acked ones
+    # are preserved by add_observation)
     for obs in observations:
         store.add_observation(obs)
 
+    # Only show NEW (unacknowledged) observations to the user
+    new_obs_ids = {o.id for o in observations}
+    unacked = store.unacknowledged_observations(limit=500)
+    new_unacked = [o for o in unacked if o.id in new_obs_ids]
+
     store.log_snapshot(
         files_checked=len(changed),
-        observations_emitted=len(observations),
+        observations_emitted=len(new_unacked),
         notes=f"watch on {len(changed)} files",
     )
 
-    if not observations:
+    if not new_unacked:
         print("  No new observations. The codebase looks consistent with active plans.")
         return
 
     print()
-    print(f"  {len(observations)} observations:")
+    print(f"  {len(new_unacked)} new observation(s):")
     print()
-    print(output.format_observations(observations, use_color=config.color))
+    print(output.format_observations(new_unacked, use_color=config.color))
 
     # In staged mode, also print severity summary for the hook
     if args.staged:
-        errors = [o for o in observations if o.severity == "error"]
-        warnings = [o for o in observations if o.severity == "warning"]
+        errors = [o for o in new_unacked if o.severity == "error"]
+        warnings = [o for o in new_unacked if o.severity == "warning"]
         if errors:
             print(f"severity: error ({len(errors)} found)")
         if warnings:
@@ -551,6 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("text", nargs="*")
     p_plan.add_argument("--list", action="store_true")
     p_plan.add_argument("--done", metavar="ID")
+    p_plan.add_argument("--keywords", metavar="KW", help="Explicit keyword categories (comma-separated, e.g. 'auth,api')")
     p_plan.set_defaults(func=cmd_plan)
 
     p_watch = sub.add_parser("watch", help="Run proactive analyzers")

@@ -145,6 +145,13 @@ class Store:
         yield self._conn
         self._conn.commit()
 
+    def close(self):
+        """Close the database connection."""
+        if self._conn is not None:
+            self._conn.commit()
+            self._conn.close()
+            self._conn = None
+
     def init_schema(self):
         # Create initial schema
         with self.conn() as c:
@@ -212,18 +219,34 @@ class Store:
 
     def upsert_function(self, fn: Function):
         with self.conn() as c:
-            c.execute(
-                """INSERT OR REPLACE INTO functions
-                   (qualified_name, name, file_path, start_line, end_line,
-                    arg_names, signature_hash, body_hash, ast_summary,
-                    complexity, docstring, callers, first_seen, last_modified, is_dead)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (fn.qualified_name, fn.name, fn.file_path, fn.start_line, fn.end_line,
-                 json.dumps(fn.arg_names), fn.signature_hash, fn.body_hash,
-                 fn.ast_summary, fn.complexity, fn.docstring,
-                 json.dumps(fn.callers), fn.first_seen, fn.last_modified,
-                 int(fn.is_dead)),
-            )
+            # Check if 'calls' column exists (v0.3.0+); fall back gracefully
+            try:
+                c.execute(
+                    """INSERT OR REPLACE INTO functions
+                       (qualified_name, name, file_path, start_line, end_line,
+                        arg_names, signature_hash, body_hash, ast_summary,
+                        complexity, docstring, calls, callers, first_seen, last_modified, is_dead)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (fn.qualified_name, fn.name, fn.file_path, fn.start_line, fn.end_line,
+                     json.dumps(fn.arg_names), fn.signature_hash, fn.body_hash,
+                     fn.ast_summary, fn.complexity, fn.docstring,
+                     json.dumps(fn.calls), json.dumps(fn.callers),
+                     fn.first_seen, fn.last_modified, int(fn.is_dead)),
+                )
+            except sqlite3.OperationalError:
+                # Pre-v0.3.0 schema without 'calls' column
+                c.execute(
+                    """INSERT OR REPLACE INTO functions
+                       (qualified_name, name, file_path, start_line, end_line,
+                        arg_names, signature_hash, body_hash, ast_summary,
+                        complexity, docstring, callers, first_seen, last_modified, is_dead)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (fn.qualified_name, fn.name, fn.file_path, fn.start_line, fn.end_line,
+                     json.dumps(fn.arg_names), fn.signature_hash, fn.body_hash,
+                     fn.ast_summary, fn.complexity, fn.docstring,
+                     json.dumps(fn.callers), fn.first_seen, fn.last_modified,
+                     int(fn.is_dead)),
+                )
 
     def get_function(self, qualified_name: str) -> Optional[Function]:
         with self.conn() as c:
@@ -265,13 +288,20 @@ class Store:
             return [self._row_to_function(r) for r in rows]
 
     def _row_to_function(self, row) -> Function:
+        # 'calls' column may not exist in pre-v0.3.0 databases
+        calls = []
+        try:
+            calls = json.loads(row["calls"]) if row["calls"] else []
+        except (IndexError, sqlite3.OperationalError, json.JSONDecodeError):
+            calls = []
         return Function(
             qualified_name=row["qualified_name"], name=row["name"],
             file_path=row["file_path"], start_line=row["start_line"],
             end_line=row["end_line"], arg_names=json.loads(row["arg_names"]),
             signature_hash=row["signature_hash"], body_hash=row["body_hash"],
             ast_summary=row["ast_summary"], complexity=row["complexity"],
-            docstring=row["docstring"], callers=json.loads(row["callers"]),
+            docstring=row["docstring"], calls=calls,
+            callers=json.loads(row["callers"]),
             first_seen=row["first_seen"], last_modified=row["last_modified"],
             is_dead=bool(row["is_dead"]),
         )
@@ -279,6 +309,48 @@ class Store:
     def function_count(self) -> int:
         with self.conn() as c:
             return c.execute("SELECT COUNT(*) FROM functions").fetchone()[0]
+
+    def delete_functions_in_file(self, path: str):
+        """Delete all function rows for a file. Called before re-indexing a changed file.
+        Also cleans up embeddings. History rows are preserved (no FK after v0.3.1)."""
+        with self.conn() as c:
+            # Get the qualified names of functions being deleted
+            rows = c.execute(
+                "SELECT qualified_name FROM functions WHERE file_path = ?", (path,)
+            ).fetchall()
+            qnames = [r["qualified_name"] for r in rows]
+
+            # Delete embeddings (these have a FK to functions)
+            for qn in qnames:
+                c.execute(
+                    "DELETE FROM embeddings WHERE qualified_name = ?", (qn,)
+                )
+
+            # Now delete the functions
+            c.execute("DELETE FROM functions WHERE file_path = ?", (path,))
+
+    def delete_classes_in_file(self, path: str):
+        """Delete all class rows for a file."""
+        with self.conn() as c:
+            c.execute("DELETE FROM classes WHERE file_path = ?", (path,))
+
+    def delete_file(self, path: str):
+        """Delete a file and all its functions, classes, and embeddings.
+        History rows are preserved (they outlive the function)."""
+        with self.conn() as c:
+            # Get function qualified names before deleting (for embedding cleanup)
+            rows = c.execute(
+                "SELECT qualified_name FROM functions WHERE file_path = ?", (path,)
+            ).fetchall()
+            for row in rows:
+                qn = row["qualified_name"]
+                c.execute(
+                    "DELETE FROM embeddings WHERE qualified_name = ?",
+                    (qn,),
+                )
+            c.execute("DELETE FROM functions WHERE file_path = ?", (path,))
+            c.execute("DELETE FROM classes WHERE file_path = ?", (path,))
+            c.execute("DELETE FROM files WHERE path = ?", (path,))
 
     # --- Classes ---
 
@@ -348,18 +420,35 @@ class Store:
     # --- Observations ---
 
     def add_observation(self, obs: Observation):
+        """Add or update an observation. If an observation with the same ID
+        already exists and is acknowledged, preserve the acknowledged status
+        (don't re-report something the user already dismissed)."""
         with self.conn() as c:
-            c.execute(
-                """INSERT OR REPLACE INTO observations
-                   (id, kind, severity, message, file_path, function_qualified_name,
-                    line, related_plan_id, related_function_qualified_name,
-                    created, acknowledged)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (obs.id, obs.kind, obs.severity, obs.message, obs.file_path,
-                 obs.function_qualified_name, obs.line, obs.related_plan_id,
-                 obs.related_function_qualified_name, obs.created,
-                 int(obs.acknowledged)),
-            )
+            # Check if this observation already exists
+            existing = c.execute(
+                "SELECT acknowledged FROM observations WHERE id = ?", (obs.id,)
+            ).fetchone()
+            if existing and existing["acknowledged"]:
+                # Already acknowledged — don't overwrite (preserve ack status).
+                # Update the message in case it changed, but keep acknowledged=1.
+                c.execute(
+                    """UPDATE observations SET message = ?, severity = ?, created = ?
+                       WHERE id = ?""",
+                    (obs.message, obs.severity, obs.created, obs.id),
+                )
+            else:
+                # New observation, or update an unacknowledged one
+                c.execute(
+                    """INSERT OR REPLACE INTO observations
+                       (id, kind, severity, message, file_path, function_qualified_name,
+                        line, related_plan_id, related_function_qualified_name,
+                        created, acknowledged)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (obs.id, obs.kind, obs.severity, obs.message, obs.file_path,
+                     obs.function_qualified_name, obs.line, obs.related_plan_id,
+                     obs.related_function_qualified_name, obs.created,
+                     int(obs.acknowledged)),
+                )
 
     def unacknowledged_observations(self, limit: int = 100) -> List[Observation]:
         with self.conn() as c:

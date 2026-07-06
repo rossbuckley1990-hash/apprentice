@@ -25,7 +25,9 @@ def utcnow_iso() -> str:
 
 
 def hash_content(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    """128-bit content hash (32 hex chars). Sufficient for ~10^15 functions
+    before collision probability becomes non-negligible."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass
@@ -55,6 +57,11 @@ class Function:
     ast_summary: str     # human-readable one-liner, e.g. "calls foo, returns x"
     complexity: int      # cyclomatic complexity (rough)
     docstring: Optional[str] = None
+    # Structured call data (v0.3.0) — the source of truth for the call graph.
+    # Each entry is a raw call name as it appears in the AST: 'foo' for direct
+    # calls, '.method' for attribute calls (resolved at graph-build time),
+    # 'ClassName.method' for qualified calls.
+    calls: List[str] = field(default_factory=list)
     callers: List[str] = field(default_factory=list)  # qualified_names of callers
     # embedding stored separately (not in this row) — see EmbeddingStore
     first_seen: str = field(default_factory=utcnow_iso)

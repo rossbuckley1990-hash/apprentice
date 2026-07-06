@@ -66,24 +66,26 @@ def ast_hash_vector(func_source: str, dim: int = 256) -> List[float]:
 
 
 # =============================================================================
-# TF-IDF backend (corpus-aware, offline)
+# Hashed-TF backend (corpus-aware, offline)
 # =============================================================================
+# NOTE: This is NOT full TF-IDF — it does not compute inverse document
+# frequency. It's a hashed term-frequency vector with log-dampening.
+# We keep the backend label "tfidf" for backward compatibility with
+# existing databases, but the class name is honest. Real IDF computation
+# over the indexed corpus is on the roadmap.
 
-class TFIDFBackend:
-    """A simple TF-IDF over code tokens. Built once over the indexed corpus,
-    then each function gets a TF-IDF vector. No external dependencies."""
+class HashedTFBackend:
+    """Hashed term-frequency vectorizer. No IDF (despite the 'tfidf' label
+    stored in the DB for backward compat). Uses a hashing trick with a fixed
+    salt so the same token maps to the same dimension across runs."""
 
     def __init__(self, dim: int = 1024, salt: int = 0):
         self.dim = dim
         self.salt = salt
-        # We don't track IDF explicitly — we use a hashing trick with a fixed
-        # salt so the same token maps to the same dimension across runs.
-        # This is a "hashed TF-IDF" — fast, offline, approximate.
 
     def vectorize(self, tokens: List[str]) -> List[float]:
         counts: Counter = Counter()
         for tok in tokens:
-            # Combine token + position-class (e.g. is_operator) for richer features
             counts[tok] += 1
 
         vec = [0.0] * self.dim
@@ -95,6 +97,10 @@ class TFIDFBackend:
         # L2 normalize
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
+
+
+# Backward-compat alias
+TFIDFBackend = HashedTFBackend
 
 
 # =============================================================================
@@ -117,13 +123,21 @@ def cosine(a: List[float], b: List[float]) -> float:
 # =============================================================================
 
 class Embedder:
-    """Pluggable embedding manager. Picks the best available backend."""
+    """Pluggable embedding manager. Picks the best available backend.
+
+    The TF-IDF (hashed-TF) backend is ALWAYS constructed as the fallback,
+    so if a real backend (sentence-transformers, openai) fails, we degrade
+    gracefully instead of crashing.
+    """
 
     def __init__(self, backend: Optional[str] = None):
         if backend is None:
             backend = self._auto_backend()
         self.backend = backend
-        self._tfidf = TFIDFBackend() if backend == "tfidf" else None
+        # Always construct the fallback — it's cheap and ensures we never
+        # crash with AttributeError on the fallback path.
+        self._tfidf = TFIDFBackend()
+        self._st_model = None  # lazy-loaded sentence-transformers model
 
     @staticmethod
     def _auto_backend() -> str:
@@ -145,12 +159,15 @@ class Embedder:
         elif self.backend == "sentence-transformers":
             try:
                 from sentence_transformers import SentenceTransformer
-                if not hasattr(self, "_st_model"):
+                if self._st_model is None:
                     self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
                 vec = self._st_model.encode(source, normalize_embeddings=True)
                 return vec.tolist()
-            except Exception:
-                # Degrade gracefully
+            except Exception as e:
+                # Degrade gracefully — log the real error, fall back to TF-IDF
+                import sys
+                print(f"  [embedder] sentence-transformers failed ({type(e).__name__}: {e}), "
+                      f"falling back to tfidf", file=sys.stderr)
                 tokens = tokenize_code(source)
                 return self._tfidf.vectorize(tokens)
         elif self.backend == "openai":
@@ -161,7 +178,11 @@ class Embedder:
                     input=source, model="text-embedding-3-small"
                 )
                 return resp.data[0].embedding
-            except Exception:
+            except Exception as e:
+                # Degrade gracefully — log the real error, fall back to TF-IDF
+                import sys
+                print(f"  [embedder] openai failed ({type(e).__name__}: {e}), "
+                      f"falling back to tfidf", file=sys.stderr)
                 tokens = tokenize_code(source)
                 return self._tfidf.vectorize(tokens)
         else:
@@ -176,11 +197,13 @@ class Embedder:
                 existing = store.get_embedding(fn.qualified_name)
                 if existing and existing[1] == self.backend:
                     continue
-            # Read source
+            # Read source — use errors="replace" and catch UnicodeDecodeError
+            # (which OSError doesn't catch)
             try:
-                with open(os.path.join(root, fn.file_path), "r", encoding="utf-8") as f:
+                with open(os.path.join(root, fn.file_path), "r",
+                          encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 continue
             # Extract function source via line range
             lines = content.splitlines()

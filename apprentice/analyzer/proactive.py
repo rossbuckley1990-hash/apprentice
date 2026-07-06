@@ -34,8 +34,24 @@ def _obs(
     related_plan_id: Optional[str] = None,
     related_function_qualified_name: Optional[str] = None,
 ) -> Observation:
+    # Deterministic ID derived from (kind, location, message) so that
+    # re-running the same analyzer on the same code doesn't produce
+    # duplicate observations. The message is included (truncated) because
+    # two observations of the same kind at the same location with different
+    # messages are genuinely different findings.
+    import hashlib as _hashlib
+    fingerprint_parts = [
+        kind,
+        file_path or "",
+        function_qualified_name or "",
+        str(line or ""),
+        message[:200],  # truncate to avoid hash churn from long messages
+    ]
+    fingerprint = "|".join(fingerprint_parts)
+    obs_id = _hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+
     return Observation(
-        id=uuid.uuid4().hex[:12],
+        id=obs_id,
         kind=kind, severity=severity, message=message,
         file_path=file_path,
         function_qualified_name=function_qualified_name,
@@ -87,17 +103,25 @@ def analyze_plan_drift(
     """If active plans exist, check whether changed files match the plan's
     keyword domain. Flag drift when new code appears unrelated to any plan.
 
-    This is the Apprentice knowing your intent and checking new code against it.
+    Uses the BEST-MATCHING plan (by keyword overlap) rather than blindly
+    attaching to plans[0]. If no plan matches, the observation is still
+    emitted but without a related_plan_id.
     """
     obs: List[Observation] = []
     plans = store.active_plans()
     if not plans:
         return obs
 
-    plan_keywords_union: Set[str] = set()
+    # Compute keyword sets for each plan
+    plan_keywords: List[Tuple[Plan, Set[str]]] = []
     for p in plans:
-        plan_keywords_union |= _extract_drift_keywords(p.description)
-        plan_keywords_union |= _extract_drift_keywords(" ".join(p.keywords))
+        kws = _extract_drift_keywords(p.description)
+        kws |= _extract_drift_keywords(" ".join(p.keywords))
+        plan_keywords.append((p, kws))
+
+    plan_keywords_union: Set[str] = set()
+    for _, kws in plan_keywords:
+        plan_keywords_union |= kws
 
     if not plan_keywords_union:
         # Plans are too generic to detect drift — skip
@@ -120,8 +144,18 @@ def analyze_plan_drift(
         # Find categories in the file but NOT in any active plan
         drift = file_drift_keywords - plan_keywords_union
         if drift:
-            # Find the most relevant plan to attach
-            related_plan_id = plans[0].id  # most recent active plan
+            # Find the best-matching plan (most keyword overlap with the file)
+            best_plan = None
+            best_overlap = 0
+            for p, kws in plan_keywords:
+                overlap = len(file_drift_keywords & kws)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_plan = p
+            # If no plan matches at all, use the most recent plan as fallback
+            if best_plan is None:
+                best_plan = plans[0]
+
             obs.append(_obs(
                 kind="drift",
                 severity="info",
@@ -133,7 +167,7 @@ def analyze_plan_drift(
                     f"Either update the plan or this is unintended scope."
                 ),
                 file_path=rel_path,
-                related_plan_id=related_plan_id,
+                related_plan_id=best_plan.id,
             ))
 
     return obs
@@ -353,10 +387,18 @@ def analyze_new_pattern(
     store: Store, root: str, changed_files: List[str]
 ) -> List[Observation]:
     """When a new function has the same signature_hash as existing functions,
-    point out the family — the user may not know there's already a clique."""
+    point out the family — the user may not know there's already a clique.
+    Excludes dunder methods (__init__, __str__, etc.) which naturally share
+    signatures across classes without being clichés."""
     obs: List[Observation] = []
     for rel_path in changed_files:
         for fn in store.functions_in_file(rel_path):
+            # Skip dunders — every class has __init__(self, ...), etc.
+            if fn.name.startswith("__") and fn.name.endswith("__"):
+                continue
+            # Skip __init__ specifically (most common false positive)
+            if fn.name == "__init__":
+                continue
             siblings = store.functions_by_signature(fn.signature_hash)
             if len(siblings) <= 1:
                 continue
