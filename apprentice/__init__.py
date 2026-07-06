@@ -7,16 +7,15 @@ After Rich & Waters, "The Programmer's Apprentice" (IEEE Computer, 1988):
   - PLAN-AWARE: knows your current intent and checks new code against it
   - CLICHÉ-AWARE: recognizes patterns in use across the codebase
 
-This is what Copilot, Cursor, and Devin are NOT. They are stateless
-prompt-response tools. The Apprentice remembers.
-
-MVP scope:
-  - Python AST-based indexer (extensible to other languages)
-  - SQLite persistence (no external services required)
-  - Pluggable embeddings (default: AST-hash + TF-IDF for offline operation)
-  - Proactive analyzers: drift, duplication, dead code, complexity creep,
-    TODO-without-plan
-  - CLI: init / index / plan / watch / ask / recall
+v0.2.0 adds:
+  - LLM integration (ask, fix, summarize) — the 1988 "synthesis engine"
+  - Historical tracking (complexity trends over time)
+  - Configuration system (.apprentice.toml)
+  - Multi-language framework (Python + JavaScript/TypeScript)
+  - Git hook integration (pre-commit proactive checks)
+  - Daemon mode (always-on background watcher)
+  - Rich CLI output (colors, formatting)
+  - Schema migrations (versioned, forward-only)
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

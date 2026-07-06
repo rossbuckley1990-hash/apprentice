@@ -13,13 +13,13 @@ For 35 years this was a research vision. The AI didn't exist. Now it does.
 
 ## What makes this different
 
-| Tool | Persistent model? | Proactive? | Plan-aware? | Cliché-aware? |
-|---|---|---|---|---|
-| GitHub Copilot | ❌ | ❌ | ❌ | ❌ |
-| Cursor | partial (rules) | partial (PR only) | ❌ | ❌ |
-| Devin | ❌ (per-task) | partial (incidents) | ❌ | ❌ |
-| Claude Code | partial (sleep) | ❌ | ❌ | ❌ |
-| **Apprentice** | **✓** | **✓** | **✓** | **✓** |
+| Tool | Persistent model? | Proactive? | Plan-aware? | Cliché-aware? | LLM synthesis? |
+|---|---|---|---|---|---|
+| GitHub Copilot | ❌ | ❌ | ❌ | ❌ | ✓ |
+| Cursor | partial | partial (PR) | ❌ | ❌ | ✓ |
+| Devin | ❌ | partial | ❌ | ❌ | ✓ |
+| Claude Code | partial | ❌ | ❌ | ❌ | ✓ |
+| **Apprentice** | **✓** | **✓** | **✓** | **✓** | **✓** |
 
 Copilot, Cursor, and Devin are **stateless prompt-response tools**. They forget
 everything between sessions. They only respond when asked. They don't know what
@@ -30,15 +30,23 @@ The Apprentice is the opposite:
 - **Proactive** — runs `apprentice watch` and flags issues *without being asked*.
 - **Plan-aware** — you state an intent; the Apprentice checks new code against it.
 - **Cliché-aware** — detects when you've written the same function twice.
+- **LLM-powered** — natural-language Q&A, fix synthesis, function summarization.
 
 ## Install
 
 ```bash
 pip install -e .
+
+# Optional: LLM backends
+pip install -e ".[openai]"      # OpenAI / Z.ai GLM
+pip install -e ".[anthropic]"   # Anthropic Claude
+pip install -e ".[embeddings]"  # sentence-transformers
+pip install -e ".[daemon]"      # watchdog for file watching
+pip install -e ".[dev]"         # pytest for development
 ```
 
-Requires Python 3.9+. No external services needed for the MVP — embeddings
-default to a fully offline TF-IDF backend.
+Requires Python 3.9+. No external services needed for the core — embeddings
+default to offline TF-IDF, LLM defaults to mock mode.
 
 ## Quick start
 
@@ -48,98 +56,153 @@ apprentice init              # one-time setup
 apprentice index             # build the codebase model
 apprentice status            # see what the Apprentice knows
 
-# State an intent — the Apprentice tracks it
+# State an intent
 apprentice plan "refactor authentication to use JWT tokens"
 
-# Make some changes to your code, then:
-apprentice watch             # proactive analysis — flags drift, duplication, etc.
+# Make changes, then:
+apprentice watch             # proactive analysis
 
-# Ask about your codebase using the persistent model
-apprentice ask "where do we handle login"
-apprentice recall mymodule.myfunction
-apprentice similar mymodule.myfunction
+# LLM-powered commands (set an API key first)
+export OPENAI_API_KEY=sk-...  # or ANTHROPIC_API_KEY or ZAI_API_KEY
+apprentice ask "where do we handle login?"
+apprentice fix <observation-id>
+apprentice summarize --codebase
 
-# Review and acknowledge observations
-apprentice observations
-apprentice ack <observation-id>
+# Always-on mode
+apprentice daemon            # watches for changes, proactive in background
+
+# Git integration
+apprentice hook install      # pre-commit hook runs proactive checks
 ```
+
+## Commands (v0.2.0)
+
+| Command | Description |
+|---|---|
+| `apprentice init` | Initialize the Apprentice in this repo |
+| `apprentice index [--rebuild]` | Index the codebase (multi-language) |
+| `apprentice status` | Show what the Apprentice knows |
+| `apprentice plan <text>` | State an intent |
+| `apprentice plan --list` | List plans |
+| `apprentice plan --done ID` | Mark a plan completed |
+| `apprentice watch [--all] [--staged]` | Run proactive analyzers |
+| `apprentice observations [--all]` | Show observations |
+| `apprentice ack <ID>` | Acknowledge observations |
+| `apprentice ask <question>` | **LLM-powered** natural-language Q&A |
+| `apprentice fix <obs-id>` | **LLM-powered** fix synthesis |
+| `apprentice summarize <name>` | **LLM-powered** function summary |
+| `apprentice summarize --codebase` | **LLM-powered** codebase summary |
+| `apprentice recall <name>` | Show what the Apprentice knows about a function |
+| `apprentice similar <name>` | Find similar functions (embedding-based) |
+| `apprentice history <name>` | Show a function's complexity history |
+| `apprentice daemon` | Run as a background watcher |
+| `apprentice hook install\|uninstall\|status` | Git hook management |
+| `apprentice config [--init]` | Show or initialize configuration |
 
 ## The proactive analyzers
 
-When you run `apprentice watch`, the Apprentice runs six analyzers over the
-files that changed since the last index:
+When you run `apprentice watch`, the Apprentice runs seven analyzers:
 
-1. **Plan drift** — if you have an active plan about "auth" but new code
-   introduces "ui" work, the Apprentice flags it: *File introduces work outside
-   any active plan.*
-
-2. **Duplication** — when a new function's body-hash matches an existing
-   function's, the Apprentice points out both: *Found 2 instances of the same
-   function body. Consider extracting a shared helper.*
-
-3. **Dead code** — functions with no callers, that aren't entry points or
-   tests: *Function 'foo' has no callers and isn't an entry point. Candidate
-   for removal.*
-
-4. **Complexity creep** — functions whose cyclomatic complexity exceeds
-   thresholds: *Function 'bar' has complexity 32 (threshold 30). Strongly
-   consider refactoring.*
-
-5. **TODO without plan** — TODO/FIXME markers that don't match any active
-   plan: *FIXME added without matching active plan. Either create a plan for
-   this or it'll be forgotten.*
-
-6. **New pattern (cliché recognition)** — when you write a function whose
-   signature matches a family of existing functions: *Function 'baz' shares
-   its signature with 3 others. This is a cliché — consider whether they
-   should share an implementation.*
-
-None of these require an LLM call. They run on the structured codebase model.
-The LLM is for the *next* layer — generating fixes, explaining observations,
-synthesizing routine code — and is pluggable.
+1. **Plan drift** — flags work outside any active plan
+2. **Duplication** — detects same-body functions (clichés)
+3. **Dead code** — functions with no callers
+4. **Complexity creep** — functions exceeding complexity thresholds
+5. **TODO without plan** — TODOs that don't match any active plan
+6. **New pattern** — functions sharing signatures with existing ones
+7. **Complexity trend** (v0.2.0) — functions whose complexity is *growing over time*
 
 ## Architecture
 
 ```
 apprentice/
+├── config.py              # .apprentice.toml configuration
 ├── model/
-│   ├── entities.py     # File, Function, Class, Plan, Observation, Cliche
-│   └── store.py        # SQLite persistence (the cross-session memory)
+│   ├── entities.py        # File, Function, Class, Plan, Observation, Cliche
+│   ├── store.py           # SQLite persistence with historical tracking
+│   └── migrations.py      # Versioned schema migrations
 ├── indexer/
-│   ├── python_parser.py # AST-based; pluggable for other languages
-│   └── embedder.py      # Pluggable: TF-IDF (default, offline) | sentence-transformers | OpenAI
+│   ├── base.py            # LanguageParser interface
+│   ├── registry.py        # Language detection + parser selection
+│   ├── python_parser.py   # Python AST parser
+│   ├── javascript_parser.py # JS/TS regex parser
+│   └── embedder.py        # Pluggable: TF-IDF | sentence-transformers | OpenAI
 ├── analyzer/
-│   └── proactive.py     # The 6 proactive analyzers — what makes this the Apprentice
-└── interface/
-    └── cli.py            # init / index / plan / watch / ask / recall / similar
+│   ├── proactive.py       # 6 proactive analyzers
+│   └── historical.py      # Complexity trend analyzer
+├── llm/                   # v0.2.0: LLM integration
+│   ├── client.py          # Pluggable: OpenAI | Anthropic | Z.ai | mock
+│   ├── ask.py             # Natural-language Q&A
+│   ├── fix.py             # Fix synthesis (diff generation)
+│   └── summarize.py       # Function/codebase summarization
+├── interface/
+│   ├── cli.py             # Full CLI
+│   └── output.py          # Rich colored output
+├── daemon.py              # Background file watcher
+└── hooks.py               # Git pre-commit hook
 ```
 
-The **store** is the persistence layer — a SQLite database in `.apprentice/`
-that survives across sessions. This is the structural primitive that
-Copilot/Cursor/Devin lack.
+## Configuration
 
-The **indexer** parses Python files into typed entities (File, Function, Class)
-with structural hashes (signature_hash, body_hash) for cliché detection. The
-embedding backend is pluggable: default is offline TF-IDF; you can opt into
-sentence-transformers or OpenAI embeddings by installing the extras.
+Create `.apprentice.toml` in your repo root:
 
-The **analyzer** is the proactivity. Six pure functions, each taking the store
-+ a list of changed files and returning Observations. They never modify state
-directly — the orchestrator persists observations.
+```toml
+[llm]
+backend = "openai"  # or "anthropic", "zai", or omit for auto-detect
+model = "gpt-4o-mini"
 
-The **interface** is a CLI today. An IDE plugin (VS Code, Neovim) is the
-natural next step — same store, same analyzers, just a different front-end.
+[embeddings]
+backend = "tfidf"  # or "sentence-transformers", "openai"
+
+[analyzer]
+complexity_warn = 15
+complexity_error = 30
+
+[daemon]
+watch_interval_seconds = 5.0
+auto_acknowledge_info = false
+
+[hooks]
+block_on_error = true
+block_on_warning = false
+
+[indexing]
+ignore_dirs = ["__pycache__", ".git", "node_modules", "vendor"]
+file_extensions = [".py", ".js", ".ts"]
+```
+
+Or run `apprentice config --init` to create one with defaults.
+
+## LLM backends
+
+The Apprentice supports multiple LLM backends, auto-detected from environment:
+
+| Backend | Env var | Models |
+|---|---|---|
+| OpenAI | `OPENAI_API_KEY` | gpt-4o-mini, gpt-4o, etc. |
+| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514, claude-opus, etc. |
+| Z.ai | `ZAI_API_KEY` | glm-4-flash, glm-4, etc. |
+| Mock | (none) | Deterministic offline responses |
+
+The LLM is **optional**. The core (persistence + proactivity) works without
+any LLM. The LLM adds: natural-language `ask`, `fix` synthesis, `summarize`.
+
+## Multi-language support
+
+| Language | Parser | Status |
+|---|---|---|
+| Python | AST (ast module) | Full support |
+| JavaScript | Regex-based | Beta — finds functions, arrow functions, classes |
+| TypeScript | Regex-based | Beta — same as JS, with TS extensions |
+
+To add a new language, implement the `LanguageParser` interface in `indexer/base.py`
+and register it in `registry.py`.
 
 ## What this is NOT (yet)
 
-- **Not an LLM-powered code generator.** The MVP is the *memory + proactivity*
-  layer. LLM synthesis (the 1988 spec's "synthesis engine") is the next layer.
-- **Not an IDE plugin.** CLI only for now. The store is designed for IDE
-  integration.
-- **Not multi-language.** Python only. The `python_parser.py` interface makes
-  adding JS/TS/Rust straightforward.
-- **Not a remote service.** Local-first by design. Your codebase model lives
-  in `.apprentice/apprentice.db` and never leaves your machine.
+- **Not an IDE plugin.** CLI only. The store is designed for IDE integration.
+- **No `--apply` for fixes.** The `fix` command generates diffs; applying them is manual (or pipe to `git apply`).
+- **JS parser is regex-based.** Less accurate than AST. Replace with tree-sitter for production.
+- **No semantic drift.** Plan drift is keyword-based. Embedding-based semantic drift is the next step.
 
 ## Roadmap
 
@@ -149,13 +212,20 @@ natural next step — same store, same analyzers, just a different front-end.
 - [x] Pluggable embeddings (offline default)
 - [x] Plan tracking + drift detection
 - [x] CLI
-- [ ] LLM-backed `apprentice ask` (currently keyword search)
-- [ ] LLM-backed `apprentice fix <observation-id>` (synthesize a fix)
-- [ ] VS Code extension (uses the same store)
-- [ ] Git hook integration (run `watch` on every commit)
-- [ ] Multi-language support (JS/TS, Rust, Go)
-- [ ] Historical tracking (per-function complexity over time)
-- [ ] Sleep-time consolidation (like Claude Code's Auto Dream, but forward-looking)
+- [x] **LLM integration** (ask, fix, summarize)
+- [x] **Historical tracking** (complexity trends over time)
+- [x] **Configuration** (.apprentice.toml)
+- [x] **Multi-language** (Python + JS/TS)
+- [x] **Git hooks** (pre-commit proactive checks)
+- [x] **Daemon mode** (always-on background watcher)
+- [x] **Rich CLI** (colors, formatting)
+- [x] **Schema migrations** (versioned, forward-only)
+- [x] **CI/CD** (GitHub Actions)
+- [ ] `apprentice fix --apply` (auto-apply patches)
+- [ ] VS Code extension
+- [ ] Tree-sitter for JS/TS (replacing regex)
+- [ ] Semantic drift detection (embedding-based)
+- [ ] Sleep-time consolidation (forward-looking, like Claude Code's Auto Dream but proactive)
 
 ## Why now
 
@@ -175,8 +245,7 @@ The Programmer's Apprentice was specified in:
 - Shrobe, H. & Katz, A. (2015). "Towards a Programmer's Apprentice (Again)." AAAI Workshop.
 
 Closest existing work: Shadow-Frog (Microsoft Research), Claude Code's Auto Dream,
-Cursor Bugbot. None implements the full vision. See `docs/competition_audit.md`
-for the full landscape.
+Cursor Bugbot. None implements the full vision. See `docs/competition_audit.md`.
 
 ## License
 

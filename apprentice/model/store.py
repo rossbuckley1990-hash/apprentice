@@ -146,12 +146,26 @@ class Store:
         self._conn.commit()
 
     def init_schema(self):
+        # Create initial schema
         with self.conn() as c:
             c.executescript(SCHEMA)
             c.execute(
                 "INSERT OR REPLACE INTO apprentice_meta(key, value) VALUES (?, ?)",
                 ("schema_version", "0.1.0"),
             )
+        # Run migrations to bring schema up to the latest version
+        from .migrations import migrate, needs_migration
+        with self.conn() as c:
+            if needs_migration(c):
+                applied = migrate(c)
+                if applied:
+                    c.commit()
+                    import sys
+                    print(f"  [apprentice] schema upgraded: {', '.join(applied)}", file=sys.stderr)
+        # Close and reopen to ensure schema changes are visible
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     # --- Files ---
 
@@ -445,6 +459,94 @@ class Store:
                 "SELECT * FROM snapshot_log ORDER BY id DESC LIMIT 1"
             ).fetchone()
             return dict(row) if row else None
+
+    # --- Historical tracking (v0.2.0) ---
+
+    def snapshot_function(self, fn: Function):
+        """Record a snapshot of the function's current state."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn() as c:
+            # Check if function_history table exists (v0.2.0 migration)
+            try:
+                c.execute(
+                    """INSERT INTO function_history
+                       (qualified_name, snapshot_at, complexity, line_count,
+                        caller_count, body_hash)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (fn.qualified_name, now, fn.complexity,
+                     fn.end_line - fn.start_line + 1,
+                     len(fn.callers), fn.body_hash),
+                )
+            except sqlite3.OperationalError:
+                pass  # table doesn't exist yet — migration will handle it
+
+    def snapshot_all_functions(self):
+        """Snapshot all functions. Called at the end of each index run."""
+        for fn in self.all_functions():
+            self.snapshot_function(fn)
+
+    def function_history(self, qualified_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get the history of a function's complexity/size over time."""
+        with self.conn() as c:
+            try:
+                rows = c.execute(
+                    """SELECT * FROM function_history
+                       WHERE qualified_name = ?
+                       ORDER BY snapshot_at DESC LIMIT ?""",
+                    (qualified_name, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            except sqlite3.OperationalError:
+                return []
+
+    def complexity_trends(self, min_changes: int = 2) -> List[Dict[str, Any]]:
+        """Find functions whose complexity has changed over time.
+        Returns functions with at least `min_changes` snapshots where
+        complexity differs between first and last."""
+        with self.conn() as c:
+            try:
+                rows = c.execute(
+                    """SELECT qualified_name,
+                              MIN(complexity) as min_c,
+                              MAX(complexity) as max_c,
+                              COUNT(*) as snapshots
+                       FROM function_history
+                       GROUP BY qualified_name
+                       HAVING snapshots >= ? AND min_c != max_c
+                       ORDER BY (max_c - min_c) DESC""",
+                    (min_changes,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            except sqlite3.OperationalError:
+                return []
+
+    def save_observation_explanation(self, observation_id: str, explanation: str,
+                                      diff: str, llm_backend: str):
+        """Save an LLM-generated explanation/fix for an observation."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn() as c:
+            try:
+                c.execute(
+                    """INSERT OR REPLACE INTO observation_explanations
+                       (observation_id, explanation, diff, llm_backend, created)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (observation_id, explanation, diff, llm_backend, now),
+                )
+            except sqlite3.OperationalError:
+                pass
+
+    def get_observation_explanation(self, observation_id: str) -> Optional[Dict[str, Any]]:
+        with self.conn() as c:
+            try:
+                row = c.execute(
+                    "SELECT * FROM observation_explanations WHERE observation_id = ?",
+                    (observation_id,),
+                ).fetchone()
+                return dict(row) if row else None
+            except sqlite3.OperationalError:
+                return None
 
 
 def default_db_path(repo_root: str) -> str:

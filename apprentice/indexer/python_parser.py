@@ -210,7 +210,27 @@ IGNORE_DIRS = {
 IGNORE_FILE_PATTERNS = (".pyc", ".pyo")
 
 
+class PythonParser:
+    """Python AST-based parser. Implements the LanguageParser interface."""
+    from .base import LanguageParser as _Base
+
+    @property
+    def language_name(self) -> str:
+        return "python"
+
+    @property
+    def file_extensions(self):
+        return [".py"]
+
+    def parse_file(self, file_path: str, content: str, root: str):
+        return index_python_file(file_path, content, root)
+
+    def should_ignore(self, rel_path: str) -> bool:
+        return False
+
+
 def discover_python_files(root: str) -> List[str]:
+    """Deprecated: use discover_all_files for multi-language support."""
     files = []
     root_path = Path(root)
     for path in root_path.rglob("*"):
@@ -223,6 +243,34 @@ def discover_python_files(root: str) -> List[str]:
         if parts & IGNORE_DIRS:
             continue
         if any(str(path).endswith(pat) for pat in IGNORE_FILE_PATTERNS):
+            continue
+        files.append(str(path.relative_to(root_path)))
+    return sorted(files)
+
+
+def discover_all_files(root: str, config=None) -> List[str]:
+    """Discover all supported source files using the language registry."""
+    from .registry import supported_extensions
+
+    if config is None:
+        ignore_dirs = IGNORE_DIRS
+        exts = set(supported_extensions())
+    else:
+        ignore_dirs = set(config.ignore_dirs)
+        exts = set(config.file_extensions) & set(supported_extensions())
+
+    files = []
+    root_path = Path(root)
+    for path in root_path.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in exts:
+            continue
+        try:
+            parts = set(path.relative_to(root_path).parts)
+        except ValueError:
+            continue
+        if parts & ignore_dirs:
             continue
         files.append(str(path.relative_to(root_path)))
     return sorted(files)
@@ -343,9 +391,13 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
     return file_entity, functions, classes
 
 
-def index_repo(root: str, store: Store, verbose: bool = True) -> Dict[str, int]:
-    """Index all Python files in the repo. Updates the store incrementally."""
-    files = discover_python_files(root)
+def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Dict[str, int]:
+    """Index all supported files in the repo. Updates the store incrementally.
+    Uses the language registry to find the right parser for each file."""
+    from .registry import get_parser_for_file, supported_extensions
+
+    # Discover all supported files
+    files = discover_all_files(root, config)
     n_files = 0
     n_functions = 0
     n_classes = 0
@@ -369,7 +421,20 @@ def index_repo(root: str, store: Store, verbose: bool = True) -> Dict[str, int]:
             n_files += 1
             continue
 
-        file_entity, functions, classes = index_python_file(abs_path, content, root)
+        # Find the right parser
+        parser = get_parser_for_file(rel_path)
+        if parser is None:
+            # Unknown language — record as File only
+            line_count = content.count("\n") + 1
+            file_entity = File(
+                path=rel_path, language="unknown", content_hash=new_hash,
+                line_count=line_count, function_names=[], class_names=[],
+            )
+            store.upsert_file(file_entity)
+            n_files += 1
+            continue
+
+        file_entity, functions, classes = parser.parse_file(abs_path, content, root)
         store.upsert_file(file_entity)
         for fn in functions:
             store.upsert_function(fn)
@@ -425,6 +490,12 @@ def index_repo(root: str, store: Store, verbose: bool = True) -> Dict[str, int]:
 
     # Count cliché groups for stats
     n_cliche_groups = sum(1 for insts in body_groups.values() if len(insts) >= 2)
+
+    # Snapshot all functions for historical tracking (v0.2.0)
+    try:
+        store.snapshot_all_functions()
+    except Exception:
+        pass  # history tables might not exist yet
 
     return {
         "files": n_files,

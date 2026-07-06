@@ -393,7 +393,7 @@ ANALYZERS = [
 
 
 def run_all_analyzers(
-    store: Store, root: str, changed_files: List[str]
+    store: Store, root: str, changed_files: List[str], config=None
 ) -> List[Observation]:
     """Run every analyzer and return all observations."""
     all_obs: List[Observation] = []
@@ -402,10 +402,24 @@ def run_all_analyzers(
             new_obs = analyzer(store, root, changed_files)
             all_obs.extend(new_obs)
         except Exception as e:
-            # An analyzer shouldn't take down the whole run
             all_obs.append(_obs(
                 kind="analyzer_error",
                 severity="error",
                 message=f"Analyzer '{name}' crashed: {type(e).__name__}: {e}",
             ))
+
+    # Add historical analyzer (needs v0.2.0 schema)
+    try:
+        from .historical import analyze_complexity_trends
+        hist_obs = analyze_complexity_trends(store, root, changed_files)
+        all_obs.extend(hist_obs)
+    except Exception:
+        pass  # history tables might not exist
+
+    # Auto-acknowledge low-severity observations if configured
+    if config and config.auto_acknowledge_info:
+        for o in all_obs:
+            if o.severity == "info":
+                o.acknowledged = True
+
     return all_obs
