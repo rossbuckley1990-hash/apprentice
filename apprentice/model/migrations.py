@@ -90,6 +90,24 @@ MIGRATIONS: List[Tuple[str, str]] = [
 ]
 
 
+def _parse_version(v: str) -> Tuple[int, ...]:
+    """Parse a version string like '0.3.1' into a tuple (0, 3, 1).
+    Handles versions with any number of dot-separated numeric parts.
+    Non-numeric parts (like '0.3.1-rc1') are treated as 0.
+    """
+    parts = []
+    for p in v.split("."):
+        # Take only the leading numeric part (handles '1-rc1' → 1)
+        num = ""
+        for ch in p:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+
 def get_schema_version(conn: sqlite3.Connection) -> str:
     """Get the current schema version."""
     try:
@@ -109,17 +127,21 @@ def set_schema_version(conn: sqlite3.Connection, version: str):
 
 
 def needs_migration(conn: sqlite3.Connection) -> bool:
-    """Check if the database needs migration."""
+    """Check if the database needs migration.
+    Uses tuple-based version comparison (not lexicographic) so that
+    '0.10.0' correctly sorts after '0.9.0'."""
     current = get_schema_version(conn)
-    return current < MIGRATIONS[-1][0]
+    latest = MIGRATIONS[-1][0]
+    return _parse_version(current) < _parse_version(latest)
 
 
 def migrate(conn: sqlite3.Connection) -> List[str]:
-    """Run all pending migrations. Returns list of applied versions."""
-    current = get_schema_version(conn)
+    """Run all pending migrations. Returns list of applied versions.
+    Uses tuple-based version comparison."""
+    current = _parse_version(get_schema_version(conn))
     applied = []
     for version, sql in MIGRATIONS:
-        if version <= current:
+        if _parse_version(version) <= current:
             continue
         # Only run if there's actual SQL (not just comments/whitespace)
         import re

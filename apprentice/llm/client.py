@@ -28,6 +28,8 @@ class LLMResponse:
     text: str
     backend: str
     usage: Dict[str, int]  # {"prompt_tokens": N, "completion_tokens": M}
+    ok: bool = True          # False if the call failed (error message in `text`)
+    error: Optional[str] = None  # the exception message if ok=False
 
 
 class LLMClient:
@@ -97,6 +99,8 @@ class LLMClient:
         except Exception as e:
             return LLMResponse(
                 text=f"[LLM error: {type(e).__name__}: {e}]",
+                ok=False,
+                error=f"{type(e).__name__}: {e}",
                 backend="openai",
                 usage={"prompt_tokens": 0, "completion_tokens": 0},
             )
@@ -123,6 +127,8 @@ class LLMClient:
         except Exception as e:
             return LLMResponse(
                 text=f"[LLM error: {type(e).__name__}: {e}]",
+                ok=False,
+                error=f"{type(e).__name__}: {e}",
                 backend="anthropic",
                 usage={"prompt_tokens": 0, "completion_tokens": 0},
             )
@@ -156,6 +162,8 @@ class LLMClient:
         except Exception as e:
             return LLMResponse(
                 text=f"[LLM error: {type(e).__name__}: {e}]",
+                ok=False,
+                error=f"{type(e).__name__}: {e}",
                 backend="zai",
                 usage={"prompt_tokens": 0, "completion_tokens": 0},
             )

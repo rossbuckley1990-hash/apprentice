@@ -83,10 +83,10 @@ class JavaScriptParser:
             args_str = m.group(2).strip()
             arg_names = [a.strip().split(":")[0].split("=")[0].strip() for a in args_str.split(",") if a.strip()]
             start_line = content[: m.start()].count("\n") + 1
-            # Estimate end by finding matching brace (simplified)
-            end_line = self._find_matching_brace_end(content, m.end()) or start_line
+            brace_end_offset = self._find_matching_brace_end(content, m.end())
+            end_line = self._offset_to_line(content, brace_end_offset) if brace_end_offset > m.end() else start_line
 
-            body = content[m.end():end_line] if end_line > m.end() else ""
+            body = content[m.end():brace_end_offset] if brace_end_offset > m.end() else ""
             body_hash = hash_content(body)
             sig_hash = hash_content(f"{name}({','.join(arg_names)})")
             complexity = 1 + len(BRANCH_RE.findall(body))
@@ -105,6 +105,7 @@ class JavaScriptParser:
                 ast_summary=summary,
                 complexity=complexity,
                 docstring=None,
+                calls=[],
             ))
 
         # Find arrow functions
@@ -113,9 +114,10 @@ class JavaScriptParser:
             args_str = m.group(2).strip()
             arg_names = [a.strip().split(":")[0].split("=")[0].strip() for a in args_str.split(",") if a.strip()]
             start_line = content[: m.start()].count("\n") + 1
-            end_line = self._find_matching_brace_end(content, m.end()) or start_line
+            brace_end_offset = self._find_matching_brace_end(content, m.end())
+            end_line = self._offset_to_line(content, brace_end_offset) if brace_end_offset > m.end() else start_line
 
-            body = content[m.end():end_line] if end_line > m.end() else ""
+            body = content[m.end():brace_end_offset] if brace_end_offset > m.end() else ""
             body_hash = hash_content(body)
             sig_hash = hash_content(f"{name}({','.join(arg_names)})")
             complexity = 1 + len(BRANCH_RE.findall(body))
@@ -134,6 +136,7 @@ class JavaScriptParser:
                 ast_summary=summary,
                 complexity=complexity,
                 docstring=None,
+                calls=[],
             ))
 
         # Find classes
@@ -171,7 +174,8 @@ class JavaScriptParser:
         return file_entity, functions, classes
 
     def _find_matching_brace_end(self, content: str, start: int) -> int:
-        """Find the line number of the matching closing brace."""
+        """Find the character offset of the matching closing brace.
+        Returns the offset AFTER the closing brace, or `start` if no match."""
         depth = 1
         i = start
         while i < len(content) and depth > 0:
@@ -181,8 +185,12 @@ class JavaScriptParser:
                 depth -= 1
             i += 1
         if depth == 0:
-            return content[:i].count("\n") + 1
-        return content[:start].count("\n") + 1
+            return i  # character offset after the closing brace
+        return start  # no match found
+
+    def _offset_to_line(self, content: str, offset: int) -> int:
+        """Convert a character offset to a line number."""
+        return content[:offset].count("\n") + 1
 
     def _make_summary(self, body: str) -> str:
         """Make a rough AST summary from function body."""

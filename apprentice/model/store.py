@@ -153,13 +153,22 @@ class Store:
             self._conn = None
 
     def init_schema(self):
-        # Create initial schema
+        """Create the schema if it doesn't exist, then run migrations.
+        Only seeds '0.1.0' when the meta table is empty — never stomps
+        an existing schema_version."""
         with self.conn() as c:
             c.executescript(SCHEMA)
-            c.execute(
-                "INSERT OR REPLACE INTO apprentice_meta(key, value) VALUES (?, ?)",
-                ("schema_version", "0.1.0"),
-            )
+            # Only seed the version if this is a fresh database.
+            # Previously this unconditionally set version to '0.1.0',
+            # which caused migrations to re-run on every command.
+            row = c.execute(
+                "SELECT value FROM apprentice_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is None:
+                c.execute(
+                    "INSERT INTO apprentice_meta(key, value) VALUES (?, ?)",
+                    ("schema_version", "0.1.0"),
+                )
         # Run migrations to bring schema up to the latest version
         from .migrations import migrate, needs_migration
         with self.conn() as c:
@@ -636,6 +645,52 @@ class Store:
                 return dict(row) if row else None
             except sqlite3.OperationalError:
                 return None
+
+    def prune(self, older_than_days: int = 30) -> Dict[str, int]:
+        """Prune old acknowledged observations and orphaned history rows.
+        Returns counts of what was pruned."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+        counts = {"acknowledged_obs": 0, "orphaned_history": 0, "old_snapshots": 0}
+
+        with self.conn() as c:
+            # Prune acknowledged observations older than the cutoff
+            try:
+                cur = c.execute(
+                    "DELETE FROM observations WHERE acknowledged = 1 AND created < ?",
+                    (cutoff,),
+                )
+                counts["acknowledged_obs"] = cur.rowcount
+            except sqlite3.OperationalError:
+                pass
+
+            # Prune history rows for functions that no longer exist
+            # (orphans from renames/deletions — policy: keep history for
+            # active functions, prune orphans older than the cutoff)
+            try:
+                cur = c.execute(
+                    """DELETE FROM function_history
+                       WHERE qualified_name NOT IN
+                           (SELECT qualified_name FROM functions)
+                       AND snapshot_at < ?""",
+                    (cutoff,),
+                )
+                counts["orphaned_history"] = cur.rowcount
+            except sqlite3.OperationalError:
+                pass
+
+            # Prune old snapshot log entries
+            try:
+                cur = c.execute(
+                    "DELETE FROM snapshot_log WHERE run_at < ?",
+                    (cutoff,),
+                )
+                counts["old_snapshots"] = cur.rowcount
+            except sqlite3.OperationalError:
+                pass
+
+        return counts
 
 
 def default_db_path(repo_root: str) -> str:

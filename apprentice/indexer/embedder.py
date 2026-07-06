@@ -218,11 +218,17 @@ class Embedder:
     def find_similar(
         self, store: Store, qualified_name: str, top_k: int = 5
     ) -> List[Tuple[str, float]]:
-        """Find the top-k most similar functions to the given one."""
+        """Find the top-k most similar functions to the given one.
+        Blends token similarity (TF-IDF) with structural similarity (AST-hash)
+        for better ranking than either alone."""
         target = store.get_embedding(qualified_name)
         if target is None:
             return []
         target_vec, _ = target
+
+        # Get the target function's body_hash for structural comparison
+        target_fn = store.get_function(qualified_name)
+        target_body_hash = target_fn.body_hash if target_fn else None
 
         results: List[Tuple[str, float]] = []
         for fn in store.all_functions():
@@ -232,8 +238,18 @@ class Embedder:
             if other is None:
                 continue
             other_vec, _ = other
-            sim = cosine(target_vec, other_vec)
-            results.append((fn.qualified_name, sim))
+
+            # Token similarity (TF-IDF / hashed-TF)
+            token_sim = cosine(target_vec, other_vec)
+
+            # Structural similarity: 1.0 if same body_hash, else 0
+            struct_sim = 1.0 if (target_body_hash and fn.body_hash == target_body_hash) else 0.0
+
+            # Blend: 70% token, 30% structural (structural is a strong signal
+            # when present but sparse, so it shouldn't dominate)
+            blended = 0.7 * token_sim + 0.3 * struct_sim
+
+            results.append((fn.qualified_name, blended))
 
         results.sort(key=lambda x: -x[1])
         return results[:top_k]

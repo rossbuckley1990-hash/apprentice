@@ -32,11 +32,16 @@ from ..model.store import Store
 
 def _norm_ast(node: ast.AST) -> str:
     """Canonical string form of an AST, ignoring docstrings and normalizing
-    local variable names. Used for body_hash (duplication detection).
+    local variable AND parameter names. Used for body_hash (duplication detection).
 
     IMPORTANT: deep-copies the node before transforming, so the original AST
     is not mutated. (Previous version mutated in place, corrupting the
     ast_summary and call graph computed downstream.)
+
+    Parameters are normalized positionally (_arg0, _arg1, ...) so that two
+    functions with identical logic but different parameter names (e.g.
+    `def f(x): return x+1` and `def g(y): return y+1`) hash the same.
+    This catches the most common form of duplication.
     """
     import copy
 
@@ -46,35 +51,46 @@ def _norm_ast(node: ast.AST) -> str:
     # Deep-copy so we don't mutate the original tree
     node_copy = copy.deepcopy(node)
 
-    # Strip ONLY the leading docstring (first stmt if it's a bare string constant)
+    # Strip ONLY the leading docstring
     body = list(node_copy.body)
     if (body and isinstance(body[0], ast.Expr) and
             isinstance(body[0].value, ast.Constant) and
             isinstance(body[0].value.value, str)):
         body = body[1:]
 
-    # Normalize local variable names: any Name that is loaded/stored but is NOT
-    # a function argument and is not a global/builtin gets renamed to _local_N.
-    # We collect arg names first so we don't rename them.
+    # Build a mapping from arg names to positional placeholders (_arg0, _arg1, ...)
     arg_names: set = set()
-    for arg in node_copy.args.args:
+    arg_name_map: Dict[str, str] = {}
+    for i, arg in enumerate(node_copy.args.args):
         arg_names.add(arg.arg)
+        arg_name_map[arg.arg] = f"_arg{i}"
     if node_copy.args.vararg:
         arg_names.add(node_copy.args.vararg.arg)
+        arg_name_map[node_copy.args.vararg.arg] = "_vararg"
     if node_copy.args.kwarg:
         arg_names.add(node_copy.args.kwarg.arg)
+        arg_name_map[node_copy.args.kwarg.arg] = "_kwarg"
 
-    # Walk and normalize. We rename ALL Name nodes to _local (losing the
-    # distinction between different locals) — this is intentionally aggressive
-    # for duplication detection: two functions with the same structure but
-    # different variable names should hash the same.
+    # Walk and normalize. Rename ALL Name nodes:
+    # - args → _arg0, _arg1, ... (positional)
+    # - other locals → _local (anonymous)
     class NameNormalizer(ast.NodeTransformer):
         def visit_Name(self, n):
-            if n.id in arg_names:
-                return n  # keep arg names
-            if n.id.startswith("__") and n.id.endswith("__"):
+            if n.id in arg_name_map:
+                new_id = arg_name_map[n.id]
+            elif n.id.startswith("__") and n.id.endswith("__"):
                 return n  # keep dunder names (language primitives)
-            return ast.copy_location(ast.Name(id="_local", ctx=n.ctx), n)
+            else:
+                new_id = "_local"
+            return ast.copy_location(ast.Name(id=new_id, ctx=n.ctx), n)
+
+        # Also rename arg nodes themselves so the hash is consistent
+        def visit_arg(self, n):
+            if n.arg in arg_name_map:
+                return ast.copy_location(
+                    ast.arg(arg=arg_name_map[n.arg], annotation=n.annotation), n
+                )
+            return n
 
     body = [NameNormalizer().visit(stmt) for stmt in body]
     return ast.dump(ast.Module(body=body, type_ignores=[]))
@@ -170,124 +186,153 @@ def _complexity(func_node: ast.FunctionDef) -> int:
 # =============================================================================
 
 def _collect_calls(func_node: ast.FunctionDef) -> List[str]:
-    """Collect all call targets from the function body, structured for the
-    call graph. Returns a list of call descriptors:
+    """Collect all call targets AND value references from the function body.
 
-      - 'foo'           : a direct call to a name 'foo' (resolved by name lookup)
-      - '.method'       : a method call on some object (resolved by class context)
-      - 'Class.method'  : a qualified call (resolved by class lookup)
-      - 'module.func'   : a dotted call (best-effort, often unresolvable)
+    Call targets are used for call-graph edge resolution.
+    Value references (Name nodes in Load context, Attribute nodes in Load context)
+    are used for liveness: a function referenced as a value (e.g. in a list of
+    analyzers, or passed as a callback) is NOT dead even if it's never called
+    directly.
 
-    The call graph builder (_build_call_graph) resolves these to qualified names.
+    Returns a list of descriptors:
+      - 'call:foo'       : a direct call to name 'foo'
+      - 'call:.method'   : a method call (resolved by class context)
+      - 'call:self.method': a self.method call (within-class)
+      - 'call:Class.method': a qualified call
+      - 'ref:foo'        : a value reference to name 'foo' (liveness signal)
+      - 'ref:.method'    : a value reference to an attribute (e.g. obj.method used as value)
     """
     calls: List[str] = []
-    seen = set()
+    seen_calls = set()
+    seen_refs = set()
+
     for node in ast.walk(func_node):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Name):
-            # Direct call: foo()
-            name = func.id
-            if name not in seen:
-                seen.add(name)
-                calls.append(name)
-        elif isinstance(func, ast.Attribute):
-            # Method or dotted call: obj.method() or module.func()
-            attr = func.attr
-            if isinstance(func.value, ast.Name):
-                # obj.method() — record as '.method' for within-class resolution
-                # Also record the receiver variable name for type inference
-                receiver = func.value.id
-                call_desc = f".{attr}"
-                if call_desc not in seen:
-                    seen.add(call_desc)
-                    calls.append(call_desc)
-                # If the receiver is 'self', this is a method call within the class
-                if receiver == "self":
-                    self_call = f"self.{attr}"
-                    if self_call not in seen:
-                        seen.add(self_call)
-                        calls.append(self_call)
-            elif isinstance(func.value, ast.Attribute):
-                # module.Class.method() — record as 'Class.method'
-                if isinstance(func.value.value, ast.Name):
-                    qualified = f"{func.value.value.id}.{func.value.attr}.{attr}"
-                    if qualified not in seen:
-                        seen.add(qualified)
-                        calls.append(qualified)
-                else:
-                    call_desc = f".{attr}"
-                    if call_desc not in seen:
-                        seen.add(call_desc)
+        # Collect call targets
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                name = func.id
+                key = f"call:{name}"
+                if key not in seen_calls:
+                    seen_calls.add(key)
+                    calls.append(key)
+            elif isinstance(func, ast.Attribute):
+                attr = func.attr
+                if isinstance(func.value, ast.Name):
+                    receiver = func.value.id
+                    call_desc = f"call:.{attr}"
+                    if call_desc not in seen_calls:
+                        seen_calls.add(call_desc)
                         calls.append(call_desc)
-            else:
-                # Complex receiver: (expr).method()
-                call_desc = f".{attr}"
-                if call_desc not in seen:
-                    seen.add(call_desc)
-                    calls.append(call_desc)
+                    if receiver == "self":
+                        self_call = f"call:self.{attr}"
+                        if self_call not in seen_calls:
+                            seen_calls.add(self_call)
+                            calls.append(self_call)
+                elif isinstance(func.value, ast.Attribute):
+                    if isinstance(func.value.value, ast.Name):
+                        qualified = f"call:{func.value.value.id}.{func.value.attr}.{attr}"
+                        if qualified not in seen_calls:
+                            seen_calls.add(qualified)
+                            calls.append(qualified)
+                else:
+                    call_desc = f"call:.{attr}"
+                    if call_desc not in seen_calls:
+                        seen_calls.add(call_desc)
+                        calls.append(call_desc)
+
+        # Collect value references (Name in Load context) for liveness
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            name = node.id
+            key = f"ref:{name}"
+            if key not in seen_refs:
+                seen_refs.add(key)
+                calls.append(key)
+
+        # Also collect attribute references (obj.attr used as value, not called)
+        # e.g. set_defaults(func=cmd_init) — cmd_init is an Attribute.value
+        # in Load context, not a call.
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            # Only collect if the attribute itself is used as a value
+            # (not when it's part of a call, which is handled above)
+            if not isinstance(node, ast.Call):  # this check isn't quite right
+                attr = node.attr
+                key = f"ref:.{attr}"
+                if key not in seen_refs:
+                    seen_refs.add(key)
+                    calls.append(key)
+
     return calls
 
 
 def _build_call_graph(functions: List[Function]) -> Dict[str, List[str]]:
     """Build the caller map from structured call data.
 
-    Uses the `calls` field on each Function (populated from the AST by
-    _collect_calls). Resolves:
-      - Direct calls ('foo') by name → qualified name lookup
+    Uses the `calls` field on each Function. Resolves:
+      - Direct calls ('call:foo') by name → qualified name lookup
       - self.method calls by class context → Class.method
-      - .method calls by best-effort class context (if the function is a method,
-        try resolving .method against sibling methods in the same class)
+      - .method calls by best-effort class context
+      - Value references ('ref:foo') for liveness — a function referenced
+        as a value is NOT dead even if never called directly
 
-    Returns: qualified_name -> list of qualified_names that call it.
+    Returns: qualified_name -> list of qualified_names that call OR reference it.
     """
-    # Build name -> qualified_name index (handles direct calls)
+    # Build name -> qualified_name index (handles direct calls + refs)
     name_to_qualified: Dict[str, List[str]] = {}
     # Build method_name -> list of qualified names (handles method calls)
-    # e.g. 'method' -> ['module.Class1.method', 'module.Class2.method']
     method_to_qualified: Dict[str, List[str]] = {}
     # Build class_name -> set of method qualified_names (for self.method resolution)
+    # Key is the FULL class qualified name (module.Class), not just Class
     class_methods: Dict[str, List[str]] = {}
+    # Map short class name -> list of full class qualified names
+    # (for resolving self.method when we only know the short name)
+    short_to_full_class: Dict[str, List[str]] = {}
 
     for fn in functions:
         name_to_qualified.setdefault(fn.name, []).append(fn.qualified_name)
-        # If this function is a method (qualified_name has 3+ parts), index it
-        parts = fn.qualified_name.rsplit(".", 2)
-        if len(parts) >= 2:
-            # Could be module.Class.method or Class.method
+
+        # Determine if this is a method by checking if it has a class context
+        # Methods now have qualified names like module.Class.method (3+ parts)
+        parts = fn.qualified_name.split(".")
+        if len(parts) >= 3:
+            # module.Class.method
             method_name = fn.name
             method_to_qualified.setdefault(method_name, []).append(fn.qualified_name)
-            if len(parts) >= 3:
-                class_name = parts[-2]
-                class_methods.setdefault(class_name, []).append(fn.qualified_name)
+            # Full class qualified name is everything except the method
+            class_full_qname = ".".join(parts[:-1])
+            class_methods.setdefault(class_full_qname, []).append(fn.qualified_name)
+            # Also index by short class name
+            short_class = parts[-2]
+            short_to_full_class.setdefault(short_class, []).append(class_full_qname)
 
     callers: Dict[str, List[str]] = {fn.qualified_name: [] for fn in functions}
 
     for fn in functions:
         # Determine the class context of this function (if it's a method)
-        fn_parts = fn.qualified_name.rsplit(".", 2)
-        fn_class = None
+        fn_parts = fn.qualified_name.split(".")
+        fn_class_full = None
+        fn_class_short = None
         if len(fn_parts) >= 3:
-            fn_class = fn_parts[-2]
+            fn_class_full = ".".join(fn_parts[:-1])  # module.Class
+            fn_class_short = fn_parts[-2]  # Class
 
         for call_desc in fn.calls:
             target_qualified = None
 
-            if call_desc.startswith("self."):
+            if call_desc.startswith("call:self."):
                 # self.method() — resolve within the same class
-                method_name = call_desc[5:]
-                if fn_class and fn_class in class_methods:
-                    for qn in class_methods[fn_class]:
+                method_name = call_desc[len("call:self."):]
+                if fn_class_full and fn_class_full in class_methods:
+                    for qn in class_methods[fn_class_full]:
                         if qn.rsplit(".", 1)[-1] == method_name:
                             target_qualified = qn
                             break
 
-            elif call_desc.startswith("."):
-                # .method() — try within-class first, then global
-                method_name = call_desc[1:]
-                if fn_class and fn_class in class_methods:
-                    for qn in class_methods[fn_class]:
+            elif call_desc.startswith("call:."):
+                # .method() — try within-class first, then global unique lookup
+                method_name = call_desc[len("call:."):]
+                if fn_class_full and fn_class_full in class_methods:
+                    for qn in class_methods[fn_class_full]:
                         if qn.rsplit(".", 1)[-1] == method_name:
                             target_qualified = qn
                             break
@@ -298,26 +343,54 @@ def _build_call_graph(functions: List[Function]) -> Dict[str, List[str]]:
                         target_qualified = candidates[0]
                     # If multiple, we can't resolve without type info — skip
 
-            elif "." in call_desc:
+            elif call_desc.startswith("call:") and "." in call_desc:
                 # Class.method or module.func — try direct qualified lookup
-                if call_desc in name_to_qualified:
-                    target_qualified = call_desc
+                name_part = call_desc[len("call:"):]
+                if name_part in name_to_qualified:
+                    target_qualified = name_part
                 else:
-                    # Try suffix match: 'Class.method' might match 'module.Class.method'
-                    for qn_list in [name_to_qualified.get(call_desc.split(".")[-1], [])]:
-                        for qn in qn_list:
-                            if qn.endswith(call_desc):
-                                target_qualified = qn
-                                break
+                    # Try suffix match
+                    for qn in name_to_qualified.get(name_part.split(".")[-1], []):
+                        if qn.endswith(name_part):
+                            target_qualified = qn
+                            break
 
-            else:
+            elif call_desc.startswith("call:"):
                 # Direct call: foo()
-                candidates = name_to_qualified.get(call_desc, [])
+                name_part = call_desc[len("call:"):]
+                candidates = name_to_qualified.get(name_part, [])
                 if len(candidates) == 1:
                     target_qualified = candidates[0]
                 elif len(candidates) > 1:
-                    # Ambiguous — skip (can't resolve without module context)
+                    # Ambiguous — skip
                     pass
+
+            elif call_desc.startswith("ref:"):
+                # Value reference — for liveness only.
+                # A function referenced as a value (e.g. in a list, or as a
+                # callback argument) is NOT dead. We add a "reference" edge
+                # which counts as being alive.
+                name_part = call_desc[len("ref:"):]
+                if name_part.startswith("."):
+                    # Attribute reference (obj.method as value)
+                    method_name = name_part[1:]
+                    candidates = method_to_qualified.get(method_name, [])
+                    if len(candidates) == 1:
+                        target_qualified = candidates[0]
+                else:
+                    # Name reference (foo as value)
+                    candidates = name_to_qualified.get(name_part, [])
+                    if len(candidates) == 1:
+                        target_qualified = candidates[0]
+                    elif len(candidates) > 1:
+                        # For references, we can be more lenient — mark ALL
+                        # candidates as "referenced" since we don't know which
+                        # one is meant. This avoids false dead-code for
+                        # overloaded names.
+                        for c in candidates:
+                            if c != fn.qualified_name:
+                                callers.setdefault(c, []).append(fn.qualified_name)
+                        continue
 
             if target_qualified and target_qualified != fn.qualified_name:
                 callers.setdefault(target_qualified, []).append(fn.qualified_name)
@@ -407,6 +480,32 @@ def discover_all_files(root: str, config=None) -> List[str]:
     return sorted(files)
 
 
+def _collect_module_refs(tree: ast.Module) -> List[str]:
+    """Collect all Name/Attribute references at module scope (outside function/class bodies).
+    These are used for liveness: a function referenced at module scope (e.g. in a list
+    like ANALYZERS = [(..., analyze_dead_code), ...], or as set_defaults(func=cmd_init))
+    is NOT dead even if never called directly.
+    """
+    refs: List[str] = []
+    seen = set()
+    for node in ast.iter_child_nodes(tree):
+        # Skip function and class definitions — their bodies are handled by _collect_calls
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                key = f"ref:{sub.id}"
+                if key not in seen:
+                    seen.add(key)
+                    refs.append(key)
+            elif isinstance(sub, ast.Attribute) and isinstance(sub.ctx, ast.Load):
+                key = f"ref:.{sub.attr}"
+                if key not in seen:
+                    seen.add(key)
+                    refs.append(key)
+    return refs
+
+
 def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, List[Function], List[Class]]:
     """Parse a Python file into entities."""
     rel_path = os.path.relpath(file_path, root)
@@ -441,10 +540,24 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
             self.parent_stack: List[str] = []
 
         def _qualified(self, name: str) -> str:
+            """Build a fully-qualified name including the module prefix.
+            e.g. for a method 'foo' in class 'Bar' in module 'pkg.mod':
+              returns 'pkg.mod.Bar.foo'
+            This ensures methods from different modules never collide
+            and the call graph can resolve self.method() calls reliably."""
+            parts = []
+            if module_qname:
+                parts.append(module_qname)
+            parts.extend(self.parent_stack)
+            parts.append(name)
+            return ".".join(parts)
+
+        def _class_context(self) -> Optional[str]:
+            """Return the current class name (for self.method resolution),
+            or None if we're at module level."""
             if self.parent_stack:
-                return ".".join(self.parent_stack + [name])
-            # Use module-qualified name
-            return f"{module_qname}.{name}" if module_qname else name
+                return self.parent_stack[-1]
+            return None
 
         def visit_ClassDef(self, node: ast.ClassDef):
             qname = self._qualified(node.name)
@@ -515,6 +628,18 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
             # (we'd need a more sophisticated qualified-name scheme)
 
     Visitor().visit(tree)
+
+    # Collect module-level value references for liveness.
+    # Functions referenced at module scope (in lists like ANALYZERS, or as
+    # arguments to set_defaults(func=...)) are NOT dead. We collect these
+    # and add them to every function in this file's calls list. This is
+    # slightly imprecise (it adds edges from every function in the file to
+    # the referenced names) but correct for liveness: the referenced function
+    # IS alive, regardless of which specific function "calls" it.
+    module_refs = _collect_module_refs(tree)
+    if module_refs:
+        for fn in functions:
+            fn.calls.extend(module_refs)
 
     file_entity = File(
         path=rel_path, language="python", content_hash=content_hash,

@@ -85,6 +85,7 @@ def cmd_init(args):
     if not (Path(root) / ".apprentice").exists() and not (Path(root) / ".git").exists():
         root = os.getcwd()  # truly fresh directory
     store = init_store(root)
+    # Ensure .apprentice/ is gitignored. Create .gitignore if it doesn't exist.
     gitignore = Path(root) / ".gitignore"
     if gitignore.exists():
         with open(gitignore, "r") as f:
@@ -95,6 +96,11 @@ def cmd_init(args):
                     f.write("\n")
                 f.write("# Apprentice local state\n.apprentice/\n")
             print("  Added .apprentice/ to .gitignore")
+    else:
+        # Create .gitignore with the Apprentice entry
+        with open(gitignore, "w") as f:
+            f.write("# Apprentice local state\n.apprentice/\n")
+        print("  Created .gitignore with .apprentice/ entry")
     print(f"  Apprentice v{__version__} initialized at {root}")
     print(f"  State: {default_db_path(root)}")
     print(f"  Next: run `apprentice index` to build the codebase model.")
@@ -247,6 +253,8 @@ def cmd_watch(args):
 
     if not new_unacked:
         print("  No new observations. The codebase looks consistent with active plans.")
+        if args.staged:
+            sys.exit(0)
         return
 
     print()
@@ -254,14 +262,14 @@ def cmd_watch(args):
     print()
     print(output.format_observations(new_unacked, use_color=config.color))
 
-    # In staged mode, also print severity summary for the hook
+    # In staged mode, use exit codes for the git hook:
+    #   0 = no blocking, 1 = error-severity found, 2 = crash
     if args.staged:
         errors = [o for o in new_unacked if o.severity == "error"]
-        warnings = [o for o in new_unacked if o.severity == "warning"]
         if errors:
             print(f"severity: error ({len(errors)} found)")
-        if warnings:
-            print(f"severity: warning ({len(warnings)} found)")
+            sys.exit(1)
+        sys.exit(0)
 
 
 def cmd_observations(args):
@@ -532,21 +540,32 @@ def cmd_config(args):
         print(f"    Config file: {'exists' if config_path.exists() else 'not found'}")
 
 
+def cmd_prune(args):
+    """Prune old acknowledged observations and orphaned history."""
+    root, store, config = get_store_and_config()
+    counts = store.prune(older_than_days=args.days)
+    print(f"  Pruned (items older than {args.days} days):")
+    print(f"    Acknowledged observations: {counts['acknowledged_obs']}")
+    print(f"    Orphaned history rows:     {counts['orphaned_history']}")
+    print(f"    Old snapshot log entries:  {counts['old_snapshots']}")
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
 
 def changed_files_since_last_index(store: Store, root: str, config=None) -> List[str]:
+    """Find files whose content_hash differs from what's stored, plus new files."""
+    from ..model.entities import hash_content
     changed = []
     for rel_path in discover_all_files(root, config):
         abs_path = os.path.join(root, rel_path)
         try:
-            with open(abs_path, "r", encoding="utf-8") as f:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except OSError:
             continue
         new_hash = hash_content(content)
-        from ..model.entities import hash_content
         existing = store.get_file(rel_path)
         if not existing or existing.content_hash != new_hash:
             changed.append(rel_path)
@@ -636,6 +655,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf = sub.add_parser("config", help="Show or init configuration")
     p_conf.add_argument("--init", action="store_true")
     p_conf.set_defaults(func=cmd_config)
+
+    p_prune = sub.add_parser("prune", help="Prune old acknowledged observations and orphaned history")
+    p_prune.add_argument("--days", type=int, default=30, help="Prune items older than this many days")
+    p_prune.set_defaults(func=cmd_prune)
 
     return p
 

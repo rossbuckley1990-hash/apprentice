@@ -132,17 +132,19 @@ class TestSelfHosting:
                 f.write(content)
 
     def test_dead_code_count_is_reasonable(self, self_indexed):
-        """The old bug flagged 63 of 102 functions as dead. After the fix,
-        the dead-code count should be much lower (most functions are called)."""
+        """After the call-graph fix (module-prefixed methods + value-references
+        as liveness), the dead-code false positive rate should be low.
+        Was 63% before fixes, 22% after first fix. Target: <15%."""
         store = self_indexed
         all_fns = store.all_functions()
         dead_fns = [f for f in all_fns if f.is_dead]
         dead_ratio = len(dead_fns) / max(len(all_fns), 1)
-        # After the fix, <30% of functions should be dead (was 63% before)
-        assert dead_ratio < 0.35, (
+        # After the v0.4.0 fixes (module prefix + value references),
+        # this should be well under 15%.
+        assert dead_ratio < 0.15, (
             f"{len(dead_fns)}/{len(all_fns)} ({dead_ratio:.0%}) functions are "
-            f"flagged as dead. The call graph is still broken — most functions "
-            f"should have callers."
+            f"flagged as dead. The call graph still has false positives — "
+            f"target is <15% after module-prefix + value-reference fixes."
         )
 
     def test_dedup_on_repeated_watch(self, self_indexed):

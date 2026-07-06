@@ -19,16 +19,31 @@ from .config import Config
 HOOK_SCRIPT = """#!/bin/bash
 # Apprentice pre-commit hook
 # Runs proactive analysis on staged files and blocks commit on errors.
+#
+# Exit code contract:
+#   0 = no blocking observations (commit allowed)
+#   1 = blocking observations found (commit blocked)
+#   2 = analyzer crashed (fail-closed: block to be safe)
+#
+# This hook is fail-closed: if the Apprentice is not installed or crashes,
+# the commit is blocked. Override with SKIP_APPRENTICE=1 git commit ...
 
 set -e
 
-# Check if apprentice is installed
-if ! command -v apprentice &>/dev/null; then
-    echo "  [apprentice] not found — skipping pre-commit check"
+# Allow bypass via env var
+if [ "$SKIP_APPRENTICE" = "1" ]; then
+    echo "  [apprentice] SKIP_APPRENTICE=1, skipping pre-commit check"
     exit 0
 fi
 
-# Get staged Python/JS files
+# Check if apprentice is installed
+if ! command -v apprentice &>/dev/null; then
+    echo "  [apprentice] not found — install with 'pip install apprentice'"
+    echo "  [apprentice] To bypass: SKIP_APPRENTICE=1 git commit ..."
+    exit 2
+fi
+
+# Get staged files (Python + JS/TS)
 STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\\.(py|js|ts|jsx|tsx)$' || true)
 
 if [ -z "$STAGED" ]; then
@@ -38,27 +53,34 @@ fi
 echo "  [apprentice] analyzing staged files..."
 
 # Run watch on staged files only
-OUTPUT=$(apprentice watch --staged 2>&1) || true
+# The --staged flag produces exit code:
+#   0 = no blocking observations
+#   1 = error-severity observations found
+#   2 = analyzer crash
+set +e
+apprentice watch --staged
+EXIT_CODE=$?
+set -e
 
-# Check for error-severity observations
-if echo "$OUTPUT" | grep -q "severity: error"; then
-    echo ""
-    echo "  [apprentice] BLOCKING COMMIT — error-severity observations found:"
-    echo "$OUTPUT" | grep -A2 "severity: error"
-    echo ""
-    echo "  To bypass: git commit --no-verify"
-    echo "  To fix: address the observations above, then re-commit"
-    exit 1
-fi
-
-# Show warnings but don't block
-if echo "$OUTPUT" | grep -q "severity: warning"; then
-    echo "  [apprentice] warnings found (commit allowed):"
-    echo "$OUTPUT" | grep -A1 "severity: warning" | head -10
-fi
-
-echo "  [apprentice] OK — no blocking observations"
-exit 0
+case $EXIT_CODE in
+    0)
+        echo "  [apprentice] OK — no blocking observations"
+        exit 0
+        ;;
+    1)
+        echo ""
+        echo "  [apprentice] BLOCKING COMMIT — error-severity observations found"
+        echo "  To bypass: SKIP_APPRENTICE=1 git commit ..."
+        echo "  To fix: address the observations above, then re-commit"
+        exit 1
+        ;;
+    *)
+        echo ""
+        echo "  [apprentice] FAIL-CLOSED — analyzer exited with code $EXIT_CODE"
+        echo "  This may indicate a crash. To bypass: SKIP_APPRENTICE=1 git commit ..."
+        exit 2
+        ;;
+esac
 """
 
 
