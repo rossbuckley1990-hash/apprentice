@@ -42,6 +42,10 @@ class LLMClient:
 
     @staticmethod
     def _auto_backend() -> str:
+        # Check for the z-ai CLI first (available in Z.ai environments)
+        import shutil
+        if shutil.which("z-ai"):
+            return "zaicli"
         if os.environ.get("OPENAI_API_KEY"):
             return "openai"
         if os.environ.get("ANTHROPIC_API_KEY"):
@@ -55,6 +59,7 @@ class LLMClient:
             "openai": "gpt-4o-mini",
             "anthropic": "claude-sonnet-4-20250514",
             "zai": "glm-4-flash",
+            "zaicli": "glm-4-plus",  # the z-ai CLI uses glm-4-plus by default
             "mock": "mock",
         }.get(self.backend, "mock")
 
@@ -65,6 +70,8 @@ class LLMClient:
     def complete(self, system: str, user: str, max_tokens: int = 2000) -> LLMResponse:
         if self.backend == "mock":
             return self._mock_complete(system, user)
+        elif self.backend == "zaicli":
+            return self._zaicli_complete(system, user, max_tokens)
         elif self.backend == "openai":
             return self._openai_complete(system, user, max_tokens)
         elif self.backend == "anthropic":
@@ -73,6 +80,80 @@ class LLMClient:
             return self._zai_complete(system, user, max_tokens)
         else:
             return self._mock_complete(system, user)
+
+    def _zaicli_complete(self, system: str, user: str, max_tokens: int) -> LLMResponse:
+        """Use the z-ai CLI (z-ai-web-dev-sdk) to call GLM models.
+        This is the backend used in Z.ai environments where the z-ai CLI
+        is available but no API key is set as an env var."""
+        import subprocess
+        import json as _json
+        import tempfile
+
+        try:
+            # Write the user prompt to a temp file to avoid shell escaping issues
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                f.write(user)
+                user_file = f.name
+
+            try:
+                result = subprocess.run(
+                    ["z-ai", "chat", "--prompt", user, "--system", system],
+                    capture_output=True, text=True, timeout=120,
+                )
+            finally:
+                import os as _os
+                _os.unlink(user_file)
+
+            if result.returncode != 0:
+                return LLMResponse(
+                    text=f"[LLM error: z-ai CLI returned {result.returncode}: {result.stderr[:200]}]",
+                    backend="zaicli",
+                    usage={"prompt_tokens": 0, "completion_tokens": 0},
+                    ok=False,
+                    error=f"z-ai CLI error: {result.stderr[:200]}",
+                )
+
+            # The z-ai CLI outputs JSON with some status lines before it.
+            # Find the JSON object in the output.
+            output = result.stdout
+            # Strip the status lines (🚀 ...)
+            json_start = output.find("{")
+            if json_start == -1:
+                return LLMResponse(
+                    text=f"[LLM error: no JSON in z-ai output]",
+                    backend="zaicli",
+                    usage={"prompt_tokens": 0, "completion_tokens": 0},
+                    ok=False,
+                    error="no JSON in z-ai output",
+                )
+
+            data = _json.loads(output[json_start:])
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            usage = data.get("usage", {})
+            return LLMResponse(
+                text=text,
+                backend="zaicli",
+                usage={
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                },
+            )
+        except subprocess.TimeoutExpired:
+            return LLMResponse(
+                text="[LLM error: z-ai CLI timed out after 120s]",
+                backend="zaicli",
+                usage={"prompt_tokens": 0, "completion_tokens": 0},
+                ok=False,
+                error="z-ai CLI timed out",
+            )
+        except Exception as e:
+            return LLMResponse(
+                text=f"[LLM error: {type(e).__name__}: {e}]",
+                backend="zaicli",
+                usage={"prompt_tokens": 0, "completion_tokens": 0},
+                ok=False,
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def _openai_complete(self, system: str, user: str, max_tokens: int) -> LLMResponse:
         try:

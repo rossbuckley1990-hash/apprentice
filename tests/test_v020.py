@@ -96,9 +96,13 @@ class TestLLM:
         assert len(resp.text) > 0
 
     def test_auto_backend_falls_back_to_mock(self, monkeypatch):
-        # Clear all API keys
+        # Clear all API keys AND ensure z-ai CLI is not found
         for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ZAI_API_KEY"]:
             monkeypatch.delenv(key, raising=False)
+        # Mock shutil.which to return None for z-ai
+        import shutil
+        original_which = shutil.which
+        monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "z-ai" else original_which(cmd))
         client = LLMClient()
         assert client.backend == "mock"
 
