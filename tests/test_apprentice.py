@@ -414,6 +414,17 @@ class TestProactive:
         obs = analyze_todos_without_plan(store, tmp_repo, ["todo.py"])
         assert len(obs) == 0  # plan matches
 
+    def test_todo_scanner_skips_test_files(self, tmp_repo):
+        write_file(tmp_repo, "tests/test_markers.py", """
+            def test_fixture_marker():
+                # TODO: fixture marker used by another test
+                assert True
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        obs = analyze_todos_without_plan(store, tmp_repo, ["tests/test_markers.py"])
+        assert obs == []
+
     def test_python_todo_scanner_ignores_string_literals(self, tmp_repo):
         write_file(tmp_repo, "strings.py", '''
             def fixture():
@@ -468,6 +479,74 @@ class TestProactive:
         index_repo(tmp_repo, store, verbose=False)
         obs = analyze_new_pattern(store, tmp_repo, ["parsers.py"])
         assert not [o for o in obs if o.kind == "new_pattern"]
+
+    def test_duplication_skips_test_helpers(self, tmp_repo):
+        write_file(tmp_repo, "tests/test_a.py", """
+            def make_user():
+                name = "ross"
+                email = "ross@example.com"
+                return {"name": name, "email": email}
+        """)
+        write_file(tmp_repo, "tests/test_b.py", """
+            def make_user_again():
+                name = "ross"
+                email = "ross@example.com"
+                return {"name": name, "email": email}
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        obs = analyze_duplication(store, tmp_repo, ["tests/test_a.py", "tests/test_b.py"])
+        assert obs == []
+
+    def test_duplication_skips_cross_class_interface_methods(self, tmp_repo):
+        write_file(tmp_repo, "parsers.py", """
+            class PythonParser:
+                def should_ignore(self, path):
+                    return False
+
+            class JavaScriptParser:
+                def should_ignore(self, path):
+                    return False
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        obs = analyze_duplication(store, tmp_repo, ["parsers.py"])
+        assert obs == []
+
+    def test_plan_drift_skips_tests_and_low_signal_refactor_config(self, tmp_repo):
+        write_file(tmp_repo, "config.py", """
+            def load_config(path):
+                return {"path": path}
+        """)
+        write_file(tmp_repo, "tests/test_api.py", """
+            def test_endpoint(client):
+                return client.get("/api")
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        store.upsert_plan(Plan(
+            id="refactor",
+            description="refactor indexing internals",
+            keywords=["refactor", "index"],
+        ))
+        obs = analyze_plan_drift(store, tmp_repo, ["config.py", "tests/test_api.py"])
+        assert obs == []
+
+    def test_plan_drift_matches_snake_case_keywords(self, tmp_repo):
+        write_file(tmp_repo, "service.py", """
+            def handle_api_request(payload):
+                return payload
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        store.upsert_plan(Plan(
+            id="refactor",
+            description="refactor indexing internals",
+            keywords=["refactor", "index"],
+        ))
+        obs = analyze_plan_drift(store, tmp_repo, ["service.py"])
+        assert [o.kind for o in obs] == ["drift"]
+        assert "api" in obs[0].message
 
     def test_full_watch_pipeline(self, tmp_repo):
         """End-to-end: index, plan, change, watch, get observations."""

@@ -7,6 +7,7 @@ No external dependencies. Uses ANSI escape codes directly.
 from __future__ import annotations
 import sys
 import os
+from collections import Counter
 from typing import List, Optional
 
 from ..model.entities import Observation
@@ -66,8 +67,58 @@ KIND_COLOR = {
     "analyzer_error": Colors.RED,
 }
 
+SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+KIND_RANK = {
+    "analyzer_error": 0,
+    "complexity_creep": 1,
+    "complexity_trend": 2,
+    "todo_without_plan": 3,
+    "drift": 4,
+    "duplication": 5,
+    "dead_code": 6,
+    "new_pattern": 7,
+}
 
-def format_observations(observations: List[Observation], use_color: Optional[bool] = None) -> str:
+
+def sort_observations(observations: List[Observation]) -> List[Observation]:
+    """Stable, user-facing order: most actionable first."""
+    return sorted(
+        observations,
+        key=lambda o: (
+            SEVERITY_RANK.get(o.severity, 9),
+            KIND_RANK.get(o.kind, 9),
+            o.file_path or "",
+            o.line or 0,
+            o.function_qualified_name or "",
+        ),
+    )
+
+
+def format_observation_summary(
+    observations: List[Observation], use_color: Optional[bool] = None
+) -> str:
+    if use_color is None:
+        use_color = _supports_color()
+    if not observations:
+        return ""
+    by_severity = Counter(o.severity for o in observations)
+    by_kind = Counter(o.kind for o in observations)
+    severity_parts = []
+    for sev in ("error", "warning", "info"):
+        n = by_severity.get(sev, 0)
+        if n:
+            severity_parts.append(_c(f"{sev}={n}", SEVERITY_COLOR.get(sev, Colors.WHITE), use_color))
+    kind_parts = [f"{kind}={n}" for kind, n in sorted(by_kind.items())]
+    lines = [f"  Summary: {', '.join(severity_parts)}"]
+    lines.append(f"  Kinds: {', '.join(kind_parts)}")
+    return "\n".join(lines)
+
+
+def format_observations(
+    observations: List[Observation],
+    use_color: Optional[bool] = None,
+    max_items: Optional[int] = None,
+) -> str:
     """Format observations for display."""
     if use_color is None:
         use_color = _supports_color()
@@ -76,7 +127,11 @@ def format_observations(observations: List[Observation], use_color: Optional[boo
         return _c("  No observations.", Colors.DIM, use_color)
 
     lines = []
-    for obs in observations:
+    if max_items is not None:
+        max_items = max(0, max_items)
+    ordered = sort_observations(observations)
+    displayed = ordered[:max_items] if max_items is not None else ordered
+    for obs in displayed:
         sym = SEVERITY_SYMBOL.get(obs.severity, "?")
         sym_color = SEVERITY_COLOR.get(obs.severity, Colors.WHITE)
         kind_color = KIND_COLOR.get(obs.kind, Colors.WHITE)
@@ -99,6 +154,14 @@ def format_observations(observations: List[Observation], use_color: Optional[boo
         if loc_parts:
             lines.append(f"     location: {' '.join(loc_parts)}")
         lines.append("")
+
+    if max_items is not None and len(ordered) > max_items:
+        hidden = len(ordered) - max_items
+        lines.append(_c(
+            f"  ... {hidden} more observation(s). Run `apprentice observations --all` to inspect everything.",
+            Colors.DIM,
+            use_color,
+        ))
 
     return "\n".join(lines)
 

@@ -58,6 +58,7 @@ apprentice plan "refactor authentication to use JWT tokens"
 
 # Make changes, then:
 apprentice watch             # proactive analysis
+apprentice watch --all        # full audit; ranked, capped, no plan-drift firehose
 
 # LLM-powered commands (set an API key first)
 export OPENAI_API_KEY=sk-...  # or ANTHROPIC_API_KEY or ZAI_API_KEY
@@ -82,7 +83,7 @@ apprentice hook install      # pre-commit hook runs proactive checks
 | `apprentice plan <text>` | State an intent |
 | `apprentice plan --list` | List plans |
 | `apprentice plan --done ID` | Mark a plan completed |
-| `apprentice watch [--all] [--staged]` | Run proactive analyzers |
+| `apprentice watch [--all] [--staged] [--limit N]` | Run proactive analyzers |
 | `apprentice observations [--all]` | Show observations |
 | `apprentice ack <ID>` | Acknowledge observations |
 | `apprentice ask <question>` | **LLM-powered** natural-language Q&A |

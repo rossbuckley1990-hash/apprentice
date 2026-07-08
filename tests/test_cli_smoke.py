@@ -11,13 +11,14 @@ import sys
 import shutil
 import tempfile
 import subprocess
+import argparse
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from apprentice.interface.cli import main as cli_main
+from apprentice.interface.cli import main as cli_main, _non_negative_int
 
 
 @pytest.fixture
@@ -54,6 +55,11 @@ class Calculator:
 
 
 class TestCLISmoke:
+
+    def test_watch_limit_rejects_negative_values(self):
+        assert _non_negative_int("0") == 0
+        with pytest.raises(argparse.ArgumentTypeError):
+            _non_negative_int("-1")
 
     def test_init(self, cli_repo):
         """init was already run in the fixture; verify .apprentice/ exists."""
@@ -127,6 +133,25 @@ class TestCLISmoke:
         """watch --all analyzes everything."""
         rc = cli_main(["watch", "--all"])
         assert rc == 0
+
+    def test_watch_all_is_ranked_limited_audit(self, cli_repo, capsys):
+        """Full audit output should be useful, not a plan-drift wall."""
+        with open(os.path.join(cli_repo, "extra.py"), "w") as f:
+            f.write("""
+# TODO: add queue export
+def unused_extra():
+    return 1
+""")
+        cli_main(["plan", "refactor authentication"])
+        capsys.readouterr()
+
+        rc = cli_main(["watch", "--all", "--limit", "1"])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "Summary:" in captured.out
+        assert "Kinds:" in captured.out
+        assert "more observation" in captured.out
+        assert "[drift]" not in captured.out
 
     def test_observations(self, cli_repo, capsys):
         """observations command shows observations."""
