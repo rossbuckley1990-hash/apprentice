@@ -186,7 +186,8 @@ def format_status(stats: dict, use_color: Optional[bool] = None) -> str:
         lines.append("")
         lines.append(_c("  Active plans:", Colors.BOLD, use_color))
         for p in stats['active_plans']:
-            lines.append(f"    {_c(f'[{p["id"]}]', Colors.DIM, use_color)} {p['description'][:80]}")
+            plan_id = _c(f"[{p['id']}]", Colors.DIM, use_color)
+            lines.append(f"    {plan_id} {p['description'][:80]}")
 
     return "\n".join(lines)
 
