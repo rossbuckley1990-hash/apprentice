@@ -121,7 +121,7 @@ apprentice/
 │   ├── base.py            # LanguageParser interface
 │   ├── registry.py        # Language detection + parser selection
 │   ├── python_parser.py   # Python AST parser
-│   ├── javascript_parser.py # JS/TS regex parser
+│   ├── javascript_parser.py # JS/TS lightweight parser
 │   └── embedder.py        # Pluggable: TF-IDF | sentence-transformers | OpenAI
 ├── analyzer/
 │   ├── proactive.py       # 6 proactive analyzers
@@ -164,7 +164,7 @@ block_on_warning = false
 
 [indexing]
 ignore_dirs = ["__pycache__", ".git", "node_modules", "vendor"]
-file_extensions = [".py", ".js", ".ts"]
+file_extensions = [".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
 ```
 
 Or run `apprentice config --init` to create one with defaults.
@@ -188,8 +188,8 @@ any LLM. The LLM adds: natural-language `ask`, `fix` synthesis, `summarize`.
 | Language | Parser | Status |
 |---|---|---|
 | Python | AST (ast module) | Full support |
-| JavaScript | Regex-based | Beta — finds functions, arrow functions, classes |
-| TypeScript | Regex-based | Beta — same as JS, with TS extensions |
+| JavaScript | Lightweight scanner | Beta — finds functions, arrows, classes, methods, and calls |
+| TypeScript | Lightweight scanner | Beta — handles common TS generics and type annotations |
 
 To add a new language, implement the `LanguageParser` interface in `indexer/base.py`
 and register it in `registry.py`.
@@ -198,7 +198,7 @@ and register it in `registry.py`.
 
 - **Not an IDE plugin.** CLI only. The store is designed for IDE integration.
 - **No `--apply` for fixes.** The `fix` command generates diffs; applying them is manual (or pipe to `git apply`).
-- **JS parser is regex-based.** Less accurate than AST. Replace with tree-sitter for production.
+- **JS parser is lightweight.** Less accurate than a full AST. Replace with tree-sitter for production.
 - **No semantic drift.** Plan drift is keyword-based. Embedding-based semantic drift is the next step.
 
 ## Roadmap
@@ -221,7 +221,7 @@ and register it in `registry.py`.
 - [x] **Self-hosting tests** (index own repo, verify analyzers don't false-positive)
 - [ ] `apprentice fix --apply` (auto-apply patches)
 - [ ] VS Code extension
-- [ ] Tree-sitter for JS/TS (replacing regex)
+- [ ] Tree-sitter for JS/TS (replacing the lightweight scanner)
 - [ ] Semantic drift detection (embedding-based)
 - [ ] Real IDF computation (currently hashed-TF, not full TF-IDF)
 - [ ] Sleep-time consolidation (forward-looking, like Claude Code's Auto Dream but proactive)

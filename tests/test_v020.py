@@ -52,6 +52,9 @@ class TestConfig:
         assert config.complexity_error == 30
         assert config.embedding_backend == "tfidf"
         assert ".py" in config.file_extensions
+        assert ".js" in config.file_extensions
+        assert ".ts" in config.file_extensions
+        assert ".tsx" in config.file_extensions
 
     def test_toml_roundtrip(self, tmp_repo):
         config = Config.defaults()
@@ -213,6 +216,7 @@ class TestMultiLanguage:
         fn_names = [f.name for f in fns]
         assert "add" in fn_names
         assert "multiply" in fn_names
+        assert any(f.qualified_name == "app.Calculator.add" for f in fns)
 
     def test_index_mixed_languages(self, tmp_repo):
         write_file(tmp_repo, "mod.py", "def py_fn(): return 1")
@@ -225,6 +229,73 @@ class TestMultiLanguage:
         langs = {f.language for f in files}
         assert "python" in langs
         assert "javascript" in langs
+
+    def test_index_mixed_languages_with_default_config(self, tmp_repo):
+        write_file(tmp_repo, "mod.py", "def py_fn(): return 1")
+        write_file(tmp_repo, "app.js", "function js_fn() { return 1; }")
+        write_file(tmp_repo, "component.tsx", "export const View = () => null")
+        config = Config.defaults()
+        assert set(discover_all_files(tmp_repo, config)) == {
+            "app.js", "component.tsx", "mod.py"
+        }
+
+        store = init_store(tmp_repo)
+        stats = index_repo(tmp_repo, store, verbose=False, config=config)
+        assert stats["files"] == 3
+        assert store.get_function("app.js_fn") is not None
+        assert store.get_function("component.View") is not None
+
+    def test_index_typescript_common_syntax(self, tmp_repo):
+        write_file(tmp_repo, "frontend/handlers.ts", """
+            export function identity<T>(value: T): T {
+                return value
+            }
+
+            const square = x => x * x
+
+            const typed = (input: string): number => {
+                return input.length
+            }
+
+            function helper(value) {
+                return value + 1
+            }
+
+            class ApiClient {
+                async fetchUser(id: string): Promise<User> {
+                    return request(`/users/${id}`)
+                }
+            }
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False, config=Config.defaults())
+        qnames = {f.qualified_name for f in store.all_functions()}
+        assert "frontend.handlers.identity" in qnames
+        assert "frontend.handlers.square" in qnames
+        assert "frontend.handlers.typed" in qnames
+        assert "frontend.handlers.helper" in qnames
+        assert "frontend.handlers.ApiClient.fetchUser" in qnames
+        assert store.get_function("frontend.handlers.identity").is_dead is False
+
+    def test_javascript_call_graph_and_string_braces(self, tmp_repo):
+        write_file(tmp_repo, "frontend/regex_traps.js", """
+            function tricky() {
+                const s = "this brace closes early: }";
+                return s.length;
+            }
+
+            function after() {
+                return tricky();
+            }
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False, config=Config.defaults())
+        tricky = store.get_function("frontend.regex_traps.tricky")
+        after = store.get_function("frontend.regex_traps.after")
+        assert tricky is not None
+        assert after is not None
+        assert after.qualified_name in tricky.callers
+        assert tricky.is_dead is False
 
 
 # =============================================================================

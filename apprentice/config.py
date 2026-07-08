@@ -46,7 +46,7 @@ class Config:
         "*.pyc", "*.pyo", "*.min.js", "*.map",
     ])
     file_extensions: List[str] = field(default_factory=lambda: [
-        ".py",  # Python is fully supported; add more as parsers are implemented
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ])
 
     # Daemon

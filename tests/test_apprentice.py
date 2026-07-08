@@ -190,6 +190,58 @@ class TestIndexer:
             "validate is flagged as dead — self.method() call resolution is broken"
         )
 
+    def test_decorated_functions_are_live(self, tmp_repo):
+        write_file(tmp_repo, "app.py", """
+            ROUTES = {}
+
+            def route(path):
+                def decorator(fn):
+                    ROUTES[path] = fn
+                    return fn
+                return decorator
+
+            @route("/health")
+            def healthcheck(request):
+                return {"ok": True}
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        fn = store.get_function("app.healthcheck")
+        assert fn is not None
+        assert fn.is_dead is False
+        assert "<decorator>" in fn.callers
+
+    def test_module_registry_keeps_handler_live(self, tmp_repo):
+        write_file(tmp_repo, "plugins.py", """
+            def process_payment(event):
+                return event["amount"] * 100
+
+            HANDLERS = {"payment.created": process_payment}
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        fn = store.get_function("plugins.process_payment")
+        assert fn is not None
+        assert fn.is_dead is False
+        assert "<module>" in fn.callers
+
+    def test_import_alias_module_registry_keeps_target_live(self, tmp_repo):
+        write_file(tmp_repo, "jobs.py", """
+            def nightly_cleanup(db, cutoff):
+                return db.delete_older_than(cutoff)
+        """)
+        write_file(tmp_repo, "app.py", """
+            from jobs import nightly_cleanup as cleanup_job
+
+            SCHEDULED_JOBS = [cleanup_job]
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        fn = store.get_function("jobs.nightly_cleanup")
+        assert fn is not None
+        assert fn.is_dead is False
+        assert "<module>" in fn.callers
+
 
 # =============================================================================
 # Embedder tests
