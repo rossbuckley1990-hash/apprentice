@@ -265,137 +265,197 @@ def _collect_calls(func_node: ast.FunctionDef) -> List[str]:
     return calls
 
 
-def _build_call_graph(functions: List[Function]) -> Dict[str, List[str]]:
-    """Build the caller map from structured call data.
+def _collect_import_aliases(tree: ast.Module) -> Dict[str, str]:
+    """Map module-local import aliases back to the imported symbol name."""
+    aliases: Dict[str, str] = {}
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                aliases[local] = alias.name.split(".")[-1]
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                aliases[local] = alias.name.split(".")[-1]
+    return aliases
 
-    Uses the `calls` field on each Function. Resolves:
-      - Direct calls ('call:foo') by name → qualified name lookup
-      - self.method calls by class context → Class.method
-      - .method calls by best-effort class context
-      - Value references ('ref:foo') for liveness — a function referenced
-        as a value is NOT dead even if never called directly
 
-    Returns: qualified_name -> list of qualified_names that call OR reference it.
-    """
-    # Build name -> qualified_name index (handles direct calls + refs)
+def _with_aliases(descriptors: List[str], aliases: Dict[str, str]) -> List[str]:
+    """Add descriptors resolved through import aliases, preserving originals."""
+    expanded = list(descriptors)
+    seen = set(expanded)
+    for desc in descriptors:
+        if ":" not in desc:
+            continue
+        prefix, name = desc.split(":", 1)
+        if prefix not in {"call", "ref", "module_ref"} or name.startswith("."):
+            continue
+
+        target = aliases.get(name)
+        if target is None and "." in name:
+            head, rest = name.split(".", 1)
+            if head in aliases:
+                target = f"{aliases[head]}.{rest}"
+        if target is None:
+            continue
+
+        key = f"{prefix}:{target}"
+        if key not in seen:
+            seen.add(key)
+            expanded.append(key)
+    return expanded
+
+
+def _module_liveness_descriptors(content: str) -> List[str]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+    aliases = _collect_import_aliases(tree)
+    return _with_aliases(_collect_module_refs(tree), aliases)
+
+
+def _build_call_indexes(functions: List[Function]) -> Dict[str, Dict[str, List[str]]]:
     name_to_qualified: Dict[str, List[str]] = {}
-    # Build method_name -> list of qualified names (handles method calls)
     method_to_qualified: Dict[str, List[str]] = {}
-    # Build class_name -> set of method qualified_names (for self.method resolution)
-    # Key is the FULL class qualified name (module.Class), not just Class
     class_methods: Dict[str, List[str]] = {}
-    # Map short class name -> list of full class qualified names
-    # (for resolving self.method when we only know the short name)
-    short_to_full_class: Dict[str, List[str]] = {}
-
+    class_name_to_methods: Dict[str, List[str]] = {}
     for fn in functions:
         name_to_qualified.setdefault(fn.name, []).append(fn.qualified_name)
-
-        # Determine if this is a method by checking if it has a class context
-        # Methods now have qualified names like module.Class.method (3+ parts)
         parts = fn.qualified_name.split(".")
         if len(parts) >= 3:
-            # module.Class.method
-            method_name = fn.name
-            method_to_qualified.setdefault(method_name, []).append(fn.qualified_name)
-            # Full class qualified name is everything except the method
+            method_to_qualified.setdefault(fn.name, []).append(fn.qualified_name)
             class_full_qname = ".".join(parts[:-1])
             class_methods.setdefault(class_full_qname, []).append(fn.qualified_name)
-            # Also index by short class name
-            short_class = parts[-2]
-            short_to_full_class.setdefault(short_class, []).append(class_full_qname)
+            class_name_to_methods.setdefault(parts[-2], []).append(fn.qualified_name)
+    return {
+        "name_to_qualified": name_to_qualified,
+        "method_to_qualified": method_to_qualified,
+        "class_methods": class_methods,
+        "class_name_to_methods": class_name_to_methods,
+    }
 
+
+def _function_class_context(fn: Function) -> Optional[str]:
+    parts = fn.qualified_name.split(".")
+    if len(parts) >= 3:
+        return ".".join(parts[:-1])
+    return None
+
+
+def _resolve_name(
+    name_part: str, indexes: Dict[str, Dict[str, List[str]]], callers: Dict[str, List[str]]
+) -> List[str]:
+    if name_part in callers:
+        return [name_part]
+    if name_part.startswith("."):
+        candidates = indexes["method_to_qualified"].get(name_part[1:], [])
+        return candidates if len(candidates) == 1 else []
+    candidates = indexes["name_to_qualified"].get(name_part, [])
+    if candidates:
+        return candidates
+    if "." not in name_part:
+        return []
+    return [
+        qn for qn in indexes["name_to_qualified"].get(name_part.split(".")[-1], [])
+        if qn.endswith(name_part)
+    ]
+
+
+def _resolve_class_method(
+    method_name: str, fn_class_full: Optional[str], indexes: Dict[str, Dict[str, List[str]]]
+) -> Optional[str]:
+    if not fn_class_full:
+        return None
+    for qn in indexes["class_methods"].get(fn_class_full, []):
+        if qn.rsplit(".", 1)[-1] == method_name:
+            return qn
+    return None
+
+
+def _resolve_method_call(
+    method_name: str, fn_class_full: Optional[str], indexes: Dict[str, Dict[str, List[str]]]
+) -> Optional[str]:
+    target = _resolve_class_method(method_name, fn_class_full, indexes)
+    if target:
+        return target
+    candidates = indexes["method_to_qualified"].get(method_name, [])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_call_targets(
+    call_desc: str,
+    fn_class_full: Optional[str],
+    indexes: Dict[str, Dict[str, List[str]]],
+    callers: Dict[str, List[str]],
+) -> List[str]:
+    if call_desc.startswith("call:self."):
+        target = _resolve_class_method(call_desc[len("call:self."):], fn_class_full, indexes)
+        return [target] if target else []
+    if call_desc.startswith("call:."):
+        target = _resolve_method_call(call_desc[len("call:."):], fn_class_full, indexes)
+        return [target] if target else []
+    if call_desc.startswith("call:"):
+        candidates = _resolve_name(call_desc[len("call:"):], indexes, callers)
+        return candidates if len(candidates) == 1 else []
+    if call_desc.startswith("ref:"):
+        return _resolve_name(call_desc[len("ref:"):], indexes, callers)
+    return []
+
+
+def _add_live_marker(call_desc: str, callers: Dict[str, List[str]]) -> bool:
+    if not call_desc.startswith("live:"):
+        return False
+    parts = call_desc.split(":", 2)
+    if len(parts) >= 3 and parts[1] in callers:
+        callers[parts[1]].append(f"<{parts[2]}>")
+    return True
+
+
+def _add_module_ref(
+    call_desc: str, callers: Dict[str, List[str]], indexes: Dict[str, Dict[str, List[str]]]
+) -> bool:
+    if not call_desc.startswith("module_ref:"):
+        return False
+    name_part = call_desc[len("module_ref:"):]
+    for target in _resolve_name(name_part, indexes, callers):
+        if target in callers:
+            callers[target].append("<module>")
+    if not name_part.startswith("."):
+        class_name = name_part.split(".")[-1]
+        for method_qname in indexes["class_name_to_methods"].get(class_name, []):
+            if method_qname in callers:
+                callers[method_qname].append(f"<class:{class_name}>")
+    return True
+
+
+def _apply_call_desc(
+    fn: Function,
+    call_desc: str,
+    callers: Dict[str, List[str]],
+    indexes: Dict[str, Dict[str, List[str]]],
+) -> None:
+    if _add_live_marker(call_desc, callers) or _add_module_ref(call_desc, callers, indexes):
+        return
+    fn_class_full = _function_class_context(fn)
+    for target in _resolve_call_targets(call_desc, fn_class_full, indexes, callers):
+        if target != fn.qualified_name:
+            callers.setdefault(target, []).append(fn.qualified_name)
+
+
+def _build_call_graph(
+    functions: List[Function], external_calls: Optional[List[str]] = None
+) -> Dict[str, List[str]]:
+    """Build the caller map from structured call and liveness descriptors."""
+    indexes = _build_call_indexes(functions)
     callers: Dict[str, List[str]] = {fn.qualified_name: [] for fn in functions}
-
     for fn in functions:
-        # Determine the class context of this function (if it's a method)
-        fn_parts = fn.qualified_name.split(".")
-        fn_class_full = None
-        fn_class_short = None
-        if len(fn_parts) >= 3:
-            fn_class_full = ".".join(fn_parts[:-1])  # module.Class
-            fn_class_short = fn_parts[-2]  # Class
-
         for call_desc in fn.calls:
-            target_qualified = None
-
-            if call_desc.startswith("call:self."):
-                # self.method() — resolve within the same class
-                method_name = call_desc[len("call:self."):]
-                if fn_class_full and fn_class_full in class_methods:
-                    for qn in class_methods[fn_class_full]:
-                        if qn.rsplit(".", 1)[-1] == method_name:
-                            target_qualified = qn
-                            break
-
-            elif call_desc.startswith("call:."):
-                # .method() — try within-class first, then global unique lookup
-                method_name = call_desc[len("call:."):]
-                if fn_class_full and fn_class_full in class_methods:
-                    for qn in class_methods[fn_class_full]:
-                        if qn.rsplit(".", 1)[-1] == method_name:
-                            target_qualified = qn
-                            break
-                if target_qualified is None:
-                    # Fall back to global method lookup
-                    candidates = method_to_qualified.get(method_name, [])
-                    if len(candidates) == 1:
-                        target_qualified = candidates[0]
-                    # If multiple, we can't resolve without type info — skip
-
-            elif call_desc.startswith("call:") and "." in call_desc:
-                # Class.method or module.func — try direct qualified lookup
-                name_part = call_desc[len("call:"):]
-                if name_part in name_to_qualified:
-                    target_qualified = name_part
-                else:
-                    # Try suffix match
-                    for qn in name_to_qualified.get(name_part.split(".")[-1], []):
-                        if qn.endswith(name_part):
-                            target_qualified = qn
-                            break
-
-            elif call_desc.startswith("call:"):
-                # Direct call: foo()
-                name_part = call_desc[len("call:"):]
-                candidates = name_to_qualified.get(name_part, [])
-                if len(candidates) == 1:
-                    target_qualified = candidates[0]
-                elif len(candidates) > 1:
-                    # Ambiguous — skip
-                    pass
-
-            elif call_desc.startswith("ref:"):
-                # Value reference — for liveness only.
-                # A function referenced as a value (e.g. in a list, or as a
-                # callback argument) is NOT dead. We add a "reference" edge
-                # which counts as being alive.
-                name_part = call_desc[len("ref:"):]
-                if name_part.startswith("."):
-                    # Attribute reference (obj.method as value)
-                    method_name = name_part[1:]
-                    candidates = method_to_qualified.get(method_name, [])
-                    if len(candidates) == 1:
-                        target_qualified = candidates[0]
-                else:
-                    # Name reference (foo as value)
-                    candidates = name_to_qualified.get(name_part, [])
-                    if len(candidates) == 1:
-                        target_qualified = candidates[0]
-                    elif len(candidates) > 1:
-                        # For references, we can be more lenient — mark ALL
-                        # candidates as "referenced" since we don't know which
-                        # one is meant. This avoids false dead-code for
-                        # overloaded names.
-                        for c in candidates:
-                            if c != fn.qualified_name:
-                                callers.setdefault(c, []).append(fn.qualified_name)
-                        continue
-
-            if target_qualified and target_qualified != fn.qualified_name:
-                callers.setdefault(target_qualified, []).append(fn.qualified_name)
-
-    # Dedupe
+            _apply_call_desc(fn, call_desc, callers, indexes)
+    for call_desc in external_calls or []:
+        _add_module_ref(call_desc, callers, indexes)
     for k in callers:
         callers[k] = list(dict.fromkeys(callers[k]))
     return callers
@@ -498,11 +558,19 @@ def _collect_module_refs(tree: ast.Module) -> List[str]:
                 if key not in seen:
                     seen.add(key)
                     refs.append(key)
+                module_key = f"module_ref:{sub.id}"
+                if module_key not in seen:
+                    seen.add(module_key)
+                    refs.append(module_key)
             elif isinstance(sub, ast.Attribute) and isinstance(sub.ctx, ast.Load):
                 key = f"ref:.{sub.attr}"
                 if key not in seen:
                     seen.add(key)
                     refs.append(key)
+                module_key = f"module_ref:.{sub.attr}"
+                if module_key not in seen:
+                    seen.add(module_key)
+                    refs.append(module_key)
     return refs
 
 
@@ -610,6 +678,8 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
             summary = _ast_summary(node)
             cx = _complexity(node)
             calls = _collect_calls(node)
+            if node.decorator_list:
+                calls.append(f"live:{qname}:decorator")
 
             end_line = getattr(node, "end_lineno", node.lineno)
 
@@ -628,6 +698,10 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
             # (we'd need a more sophisticated qualified-name scheme)
 
     Visitor().visit(tree)
+    import_aliases = _collect_import_aliases(tree)
+    if import_aliases:
+        for fn in functions:
+            fn.calls = _with_aliases(fn.calls, import_aliases)
 
     # Collect module-level value references for liveness.
     # Functions referenced at module scope (in lists like ANALYZERS, or as
@@ -636,7 +710,7 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
     # slightly imprecise (it adds edges from every function in the file to
     # the referenced names) but correct for liveness: the referenced function
     # IS alive, regardless of which specific function "calls" it.
-    module_refs = _collect_module_refs(tree)
+    module_refs = _with_aliases(_collect_module_refs(tree), import_aliases)
     if module_refs:
         for fn in functions:
             fn.calls.extend(module_refs)
@@ -649,6 +723,105 @@ def index_python_file(file_path: str, content: str, root: str) -> Tuple[File, Li
     return file_entity, functions, classes
 
 
+def _read_source_file(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _remove_deleted_files(store: Store, files_on_disk: Set[str], verbose: bool) -> None:
+    n_deleted = 0
+    for f in store.all_files():
+        if f.path not in files_on_disk:
+            store.delete_file(f.path)
+            n_deleted += 1
+    if verbose and n_deleted > 0:
+        print(f"  removed {n_deleted} deleted file(s) from the model")
+
+
+def _external_calls_for_file(parser: Any, content: str) -> List[str]:
+    if parser is not None and parser.language_name == "python":
+        return _module_liveness_descriptors(content)
+    return []
+
+
+def _index_one_file(
+    root: str,
+    store: Store,
+    rel_path: str,
+    content: str,
+    parser: Any,
+) -> Tuple[int, int, int, int, List[Function]]:
+    abs_path = os.path.join(root, rel_path)
+    existing = store.get_file(rel_path)
+    new_hash = hash_content(content)
+    if existing and existing.content_hash == new_hash:
+        return 1, 0, 0, 0, store.functions_in_file(rel_path)
+
+    if existing:
+        store.delete_functions_in_file(rel_path)
+        store.delete_classes_in_file(rel_path)
+
+    if parser is None:
+        file_entity = File(
+            path=rel_path, language="unknown", content_hash=new_hash,
+            line_count=content.count("\n") + 1, function_names=[], class_names=[],
+        )
+        store.upsert_file(file_entity)
+        return 1, 0, 0, 0, []
+
+    file_entity, functions, classes = parser.parse_file(abs_path, content, root)
+    store.upsert_file(file_entity)
+    for fn in functions:
+        store.upsert_function(fn)
+    for cls in classes:
+        store.upsert_class(cls)
+    return 1, len(functions), len(classes), 1, functions
+
+
+def _apply_call_graph(store: Store, functions: List[Function], external_calls: List[str]) -> int:
+    callers_map = _build_call_graph(functions, external_calls)
+    n_dead = 0
+    for fn in functions:
+        callers = callers_map.get(fn.qualified_name, [])
+        fn.callers = callers
+        is_entry = fn.name in ("main", "__main__") or fn.name.startswith("test_")
+        is_dunder = fn.name.startswith("__") and fn.name.endswith("__")
+        fn.is_dead = (not callers) and (not is_entry) and (not is_dunder)
+        if fn.is_dead:
+            n_dead += 1
+        store.upsert_function(fn)
+    return n_dead
+
+
+def _detect_cliches(store: Store, functions: List[Function], verbose: bool) -> int:
+    if verbose:
+        print("  detecting clichés (duplication)...")
+    body_groups: Dict[str, List[str]] = {}
+    for fn in functions:
+        body_groups.setdefault(fn.body_hash, []).append(fn.qualified_name)
+    for body_hash, instances in body_groups.items():
+        if len(instances) >= 2:
+            from ..model.entities import Cliche
+            first_fn = next(f for f in functions if f.qualified_name == instances[0])
+            store.upsert_cliche(Cliche(
+                signature_hash=first_fn.signature_hash,
+                body_hash=body_hash,
+                instances=instances,
+                note=f"{len(instances)} instances of the same function body",
+            ))
+    return sum(1 for insts in body_groups.values() if len(insts) >= 2)
+
+
+def _snapshot_functions(store: Store) -> None:
+    try:
+        store.snapshot_all_functions()
+    except Exception:
+        pass
+
+
 def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Dict[str, int]:
     """Index all supported files in the repo. Updates the store incrementally.
     Uses the language registry to find the right parser for each file.
@@ -657,20 +830,12 @@ def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Di
     deleted before inserting new ones. Files no longer on disk are removed
     entirely (including their embeddings).
     """
-    from .registry import get_parser_for_file, supported_extensions
+    from .registry import get_parser_for_file
 
     # Discover all supported files currently on disk
     files_on_disk = set(discover_all_files(root, config))
 
-    # Clean up files that are in the store but no longer on disk
-    stored_files = store.all_files()
-    n_deleted = 0
-    for f in stored_files:
-        if f.path not in files_on_disk:
-            store.delete_file(f.path)
-            n_deleted += 1
-    if verbose and n_deleted > 0:
-        print(f"  removed {n_deleted} deleted file(s) from the model")
+    _remove_deleted_files(store, files_on_disk, verbose)
 
     n_files = 0
     n_functions = 0
@@ -678,103 +843,33 @@ def index_repo(root: str, store: Store, verbose: bool = True, config=None) -> Di
     n_changed = 0
 
     all_functions: List[Function] = []
+    external_calls: List[str] = []
 
     for rel_path in sorted(files_on_disk):
         abs_path = os.path.join(root, rel_path)
-        try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError:
+        content = _read_source_file(abs_path)
+        if content is None:
             continue
 
-        existing = store.get_file(rel_path)
-        new_hash = hash_content(content)
-        if existing and existing.content_hash == new_hash:
-            # Unchanged — still pull its functions for the call-graph pass
-            all_functions.extend(store.functions_in_file(rel_path))
-            n_files += 1
-            continue
-
-        # File changed (or is new) — delete stale rows before inserting
-        if existing:
-            store.delete_functions_in_file(rel_path)
-            store.delete_classes_in_file(rel_path)
-
-        # Find the right parser
         parser = get_parser_for_file(rel_path)
-        if parser is None:
-            # Unknown language — record as File only
-            line_count = content.count("\n") + 1
-            file_entity = File(
-                path=rel_path, language="unknown", content_hash=new_hash,
-                line_count=line_count, function_names=[], class_names=[],
-            )
-            store.upsert_file(file_entity)
-            n_files += 1
-            continue
-
-        file_entity, functions, classes = parser.parse_file(abs_path, content, root)
-        store.upsert_file(file_entity)
-        for fn in functions:
-            store.upsert_function(fn)
-            all_functions.append(fn)
-            n_functions += 1
-        for cls in classes:
-            store.upsert_class(cls)
-            n_classes += 1
-
-        n_files += 1
-        n_changed += 1
-
-        if verbose and n_changed % 20 == 0:
+        external_calls.extend(_external_calls_for_file(parser, content))
+        file_count, function_count, class_count, changed_count, functions = _index_one_file(
+            root, store, rel_path, content, parser
+        )
+        n_files += file_count
+        n_functions += function_count
+        n_classes += class_count
+        n_changed += changed_count
+        all_functions.extend(functions)
+        if verbose and changed_count and n_changed % 20 == 0:
             print(f"  indexed {n_files}/{len(files_on_disk)} files...")
 
     # Build call graph and update callers
     if verbose:
         print(f"  building call graph over {len(all_functions)} functions...")
-    callers_map = _build_call_graph(all_functions)
-    n_dead = 0
-    for fn in all_functions:
-        callers = callers_map.get(fn.qualified_name, [])
-        fn.callers = callers
-        # A function is "dead" if it has no callers AND it's not a dunder method
-        # AND it's not a module entry point (main, etc.)
-        is_entry = fn.name in ("main", "__main__") or fn.name.startswith("test_")
-        is_dunder = fn.name.startswith("__") and fn.name.endswith("__")
-        fn.is_dead = (not callers) and (not is_entry) and (not is_dunder)
-        if fn.is_dead:
-            n_dead += 1
-        store.upsert_function(fn)
-
-    # Detect clichés (duplication)
-    # Two kinds:
-    #   1. Same signature_hash AND same body_hash → exact same function written twice
-    #   2. Same body_hash (different signature) → same logic, different name (the common case)
-    if verbose:
-        print("  detecting clichés (duplication)...")
-    body_groups: Dict[str, List[str]] = {}
-    for fn in all_functions:
-        body_groups.setdefault(fn.body_hash, []).append(fn.qualified_name)
-    for body_hash, instances in body_groups.items():
-        if len(instances) >= 2:
-            from ..model.entities import Cliche
-            # Find the signature_hash of the first instance (for grouping)
-            first_fn = next(f for f in all_functions if f.qualified_name == instances[0])
-            sig_hash = first_fn.signature_hash
-            store.upsert_cliche(Cliche(
-                signature_hash=sig_hash, body_hash=body_hash,
-                instances=instances,
-                note=f"{len(instances)} instances of the same function body",
-            ))
-
-    # Count cliché groups for stats
-    n_cliche_groups = sum(1 for insts in body_groups.values() if len(insts) >= 2)
-
-    # Snapshot all functions for historical tracking (v0.2.0)
-    try:
-        store.snapshot_all_functions()
-    except Exception:
-        pass  # history tables might not exist yet
+    n_dead = _apply_call_graph(store, all_functions, external_calls)
+    n_cliche_groups = _detect_cliches(store, all_functions, verbose)
+    _snapshot_functions(store)
 
     return {
         "files": n_files,

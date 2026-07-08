@@ -13,7 +13,9 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import tokenize
 from datetime import datetime, timezone
+from io import StringIO
 from typing import List, Optional, Set, Dict, Tuple
 
 from ..model.entities import (
@@ -74,27 +76,122 @@ DRIFT_KEYWORDS = {
     "api": ["api", "endpoint", "route", "handler", "request", "response"],
     "ui": ["ui", "component", "render", "css", "layout", "view"],
     "db": ["db", "database", "schema", "migration", "sql", "table", "query"],
+    "index": ["index", "indexing", "parser", "parse", "registry", "embedding", "graph"],
     "perf": ["perf", "performance", "optimize", "cache", "speed", "latency"],
     "bug": ["bug", "fix", "regression", "patch"],
     "docs": ["doc", "documentation", "readme", "comment"],
     "config": ["config", "settings", "env", "deploy"],
     "security": ["security", "vulnerability", "cve", "sanitize", "escape"],
 }
+LOW_SIGNAL_DRIFT = {"docs", "test"}
+REFACTOR_COMPANION_DRIFT = {"config"}
+TEST_PATH_PARTS = {"test", "tests", "__tests__", "spec", "specs", "fixtures"}
+
+
+def _drift_tokens(text: str) -> List[str]:
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    return [tok.lower() for tok in re.split(r"[^A-Za-z0-9]+", camel_split) if tok]
 
 
 def _extract_drift_keywords(text: str) -> Set[str]:
-    """Extract semantic keywords from a plan description or commit message.
-    Uses word-boundary prefix matching: 'auth' matches 'authentication' and
-    'authenticate' but NOT 'build' (no word boundary before 'ui' in 'build')."""
-    text_lower = text.lower()
+    """Extract semantic keywords from a plan description or code text.
+
+    Prefix-match normalized tokens so 'auth' matches 'authentication' and
+    'handle_auth_request', while 'ui' still does not match 'build'.
+    """
+    tokens = _drift_tokens(text)
     found = set()
     for category, words in DRIFT_KEYWORDS.items():
-        for w in words:
-            # \b before the keyword ensures it's at the start of a word
-            # No trailing \b so it matches as a prefix (auth → authentication)
-            if re.search(r"\b" + re.escape(w), text_lower):
+        for token in tokens:
+            if any(token.startswith(w) for w in words):
                 found.add(category)
+                break
     return found
+
+
+def _path_parts(rel_path: str) -> Set[str]:
+    normalized = rel_path.replace("\\", "/")
+    parts = set()
+    for part in normalized.split("/"):
+        stem = part.rsplit(".", 1)[0]
+        parts.add(stem.lower())
+    return parts
+
+
+def _is_test_path(rel_path: str) -> bool:
+    parts = _path_parts(rel_path)
+    return bool(parts & TEST_PATH_PARTS) or any(p.startswith("test_") for p in parts)
+
+
+def _drift_after_policy(drift: Set[str], plan_categories: Set[str]) -> Set[str]:
+    drift = drift - LOW_SIGNAL_DRIFT
+    if "refactor" in plan_categories:
+        drift = drift - REFACTOR_COMPANION_DRIFT
+    return drift
+
+
+def _plan_keyword_sets(plans: List[Plan]) -> List[Tuple[Plan, Set[str]]]:
+    result = []
+    for plan in plans:
+        keywords = _extract_drift_keywords(plan.description)
+        keywords |= _extract_drift_keywords(" ".join(plan.keywords))
+        result.append((plan, keywords))
+    return result
+
+
+def _keyword_union(plan_keywords: List[Tuple[Plan, Set[str]]]) -> Set[str]:
+    union: Set[str] = set()
+    for _, keywords in plan_keywords:
+        union |= keywords
+    return union
+
+
+def _file_drift_keywords(store: Store, rel_path: str) -> Set[str]:
+    fns = store.functions_in_file(rel_path)
+    if not fns:
+        return set()
+    combined = " ".join(
+        fn.name + " " + (fn.ast_summary or "") + " " + " ".join(fn.arg_names)
+        for fn in fns
+    )
+    return _extract_drift_keywords(f"{rel_path} {combined}")
+
+
+def _best_matching_plan(
+    plans: List[Plan],
+    plan_keywords: List[Tuple[Plan, Set[str]]],
+    file_keywords: Set[str],
+) -> Plan:
+    best_plan = plans[0]
+    best_overlap = -1
+    for plan, keywords in plan_keywords:
+        overlap = len(file_keywords & keywords)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_plan = plan
+    return best_plan
+
+
+def _drift_observation(
+    rel_path: str,
+    plan: Plan,
+    plan_categories: Set[str],
+    file_categories: Set[str],
+    drift: Set[str],
+) -> Observation:
+    return _obs(
+        kind="drift",
+        severity="info",
+        message=(
+            f"File introduces work outside any active plan. "
+            f"Plan categories: {sorted(plan_categories)}. "
+            f"File categories: {sorted(file_categories)}. "
+            f"Drift: {sorted(drift)}. "
+            f"Either update the plan or this is unintended scope."
+        ),
+        file_path=rel_path,
+        related_plan_id=plan.id,
+    )
 
 
 def analyze_plan_drift(
@@ -112,62 +209,25 @@ def analyze_plan_drift(
     if not plans:
         return obs
 
-    # Compute keyword sets for each plan
-    plan_keywords: List[Tuple[Plan, Set[str]]] = []
-    for p in plans:
-        kws = _extract_drift_keywords(p.description)
-        kws |= _extract_drift_keywords(" ".join(p.keywords))
-        plan_keywords.append((p, kws))
-
-    plan_keywords_union: Set[str] = set()
-    for _, kws in plan_keywords:
-        plan_keywords_union |= kws
+    plan_keywords = _plan_keyword_sets(plans)
+    plan_keywords_union = _keyword_union(plan_keywords)
 
     if not plan_keywords_union:
         # Plans are too generic to detect drift — skip
         return obs
 
     for rel_path in changed_files:
-        fns = store.functions_in_file(rel_path)
-        if not fns:
+        if _is_test_path(rel_path):
             continue
-        # Combine all function names + summaries for keyword analysis
-        combined = " ".join(
-            fn.name + " " + (fn.ast_summary or "") + " " + " ".join(fn.arg_names)
-            for fn in fns
-        )
-        file_drift_keywords = _extract_drift_keywords(combined)
-
+        file_drift_keywords = _file_drift_keywords(store, rel_path)
         if not file_drift_keywords:
             continue  # no signal
 
-        # Find categories in the file but NOT in any active plan
-        drift = file_drift_keywords - plan_keywords_union
+        drift = _drift_after_policy(file_drift_keywords - plan_keywords_union, plan_keywords_union)
         if drift:
-            # Find the best-matching plan (most keyword overlap with the file)
-            best_plan = None
-            best_overlap = 0
-            for p, kws in plan_keywords:
-                overlap = len(file_drift_keywords & kws)
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_plan = p
-            # If no plan matches at all, use the most recent plan as fallback
-            if best_plan is None:
-                best_plan = plans[0]
-
-            obs.append(_obs(
-                kind="drift",
-                severity="info",
-                message=(
-                    f"File introduces work outside any active plan. "
-                    f"Plan categories: {sorted(plan_keywords_union)}. "
-                    f"File categories: {sorted(file_drift_keywords)}. "
-                    f"Drift: {sorted(drift)}. "
-                    f"Either update the plan or this is unintended scope."
-                ),
-                file_path=rel_path,
-                related_plan_id=best_plan.id,
+            best_plan = _best_matching_plan(plans, plan_keywords, file_drift_keywords)
+            obs.append(_drift_observation(
+                rel_path, best_plan, plan_keywords_union, file_drift_keywords, drift
             ))
 
     return obs
@@ -188,26 +248,20 @@ def analyze_duplication(
     # Get all current clichés (>= 2 instances)
     cliches = store.all_cliches(min_instances=2)
 
-    # Build a set of qualified-name prefixes for changed files
-    # so we can tell which cliché instances are in changed files
-    changed_qnames: Set[str] = set()
-    for rel_path in changed_files:
-        # Convert file path to module prefix: "pkg/mod.py" -> "pkg.mod"
-        rel_norm = rel_path.replace(os.sep, ".")
-        if rel_norm.endswith(".py"):
-            changed_qnames.add(rel_norm[:-3])
+    changed_qnames = _changed_module_prefixes(changed_files)
+    abstract_methods = _abstract_method_qnames(store)
+
+    def function_for(qname: str) -> Optional[Function]:
+        return store.get_function(qname)
 
     for cliche in cliches:
         if len(cliche.instances) < 2:
             continue
-        # Only report if at least one instance is in a changed file
-        changed_instances = []
-        for qn in cliche.instances:
-            for prefix in changed_qnames:
-                if qn.startswith(prefix + ".") or qn == prefix:
-                    changed_instances.append(qn)
-                    break
-        if not changed_instances:
+        instance_functions = [function_for(qn) for qn in cliche.instances]
+        concrete_instances = [fn for fn in instance_functions if fn is not None]
+        if _skip_duplication_cliche(concrete_instances, abstract_methods):
+            continue
+        if not _cliche_touches_changed_file(cliche.instances, changed_qnames):
             continue
 
         obs.append(_obs(
@@ -232,6 +286,47 @@ def analyze_duplication(
 
 ENTRY_POINT_NAMES = {"main", "__main__", "run", "app", "create_app", "wsgi", "asgi"}
 TEST_PREFIXES = ("test_", "Test")
+PUBLIC_API_DECORATORS = {"<decorator>", "<export>"}
+ABSTRACT_BASE_NAMES = {"ABC", "Protocol"}
+
+
+def _changed_module_prefixes(changed_files: List[str]) -> Set[str]:
+    prefixes: Set[str] = set()
+    for rel_path in changed_files:
+        rel_norm = rel_path.replace(os.sep, ".")
+        for ext in (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            if rel_norm.endswith(ext):
+                prefixes.add(rel_norm[: -len(ext)])
+                break
+    return prefixes
+
+
+def _cliche_touches_changed_file(instances: List[str], changed_qnames: Set[str]) -> bool:
+    for qn in instances:
+        for prefix in changed_qnames:
+            if qn.startswith(prefix + ".") or qn == prefix:
+                return True
+    return False
+
+
+def _abstract_method_qnames(store: Store) -> Set[str]:
+    methods = set()
+    for cls in store.all_classes():
+        if not (set(cls.bases) & ABSTRACT_BASE_NAMES):
+            continue
+        for method_name in cls.method_names:
+            methods.add(f"{cls.qualified_name}.{method_name}")
+    return methods
+
+
+def _skip_duplication_cliche(functions: List[Function], abstract_methods: Set[str]) -> bool:
+    if not functions:
+        return False
+    if all(_is_test_path(fn.file_path) for fn in functions):
+        return True
+    if all(fn.qualified_name in abstract_methods for fn in functions):
+        return True
+    return _is_cross_class_method_family(functions[0], functions)
 
 
 def analyze_dead_code(
@@ -245,6 +340,7 @@ def analyze_dead_code(
     changed_fns: List[Function] = []
     for rel_path in changed_files:
         changed_fns.extend(store.functions_in_file(rel_path))
+    abstract_methods = _abstract_method_qnames(store)
 
     for fn in changed_fns:
         if not fn.is_dead:
@@ -255,13 +351,18 @@ def analyze_dead_code(
             continue
         if fn.name.startswith("__") and fn.name.endswith("__"):
             continue
+        if any(caller in PUBLIC_API_DECORATORS for caller in fn.callers):
+            continue
+        if fn.qualified_name in abstract_methods:
+            continue
         # Don't re-flag the same dead function we already noted
         obs.append(_obs(
             kind="dead_code",
             severity="info",
             message=(
-                f"Function '{fn.qualified_name}' has no callers and isn't an entry point "
-                f"or test. Candidate for removal, or add a caller."
+                f"Function '{fn.qualified_name}' has no internal callers in the indexed graph. "
+                f"If it is not external API or framework-discovered code, consider removing it "
+                f"or adding an explicit caller/registration."
             ),
             file_path=fn.file_path,
             function_qualified_name=fn.qualified_name,
@@ -320,7 +421,37 @@ def analyze_complexity(
 # Analyzer 5: TODO/FIXME without a plan entry
 # =============================================================================
 
-TODO_RE = re.compile(r"#\s*(TODO|FIXME|HACK|XXX|BUG)[:\s]*(.+)", re.IGNORECASE)
+TODO_RE = re.compile(r"(?:#|//)\s*(TODO|FIXME|HACK|XXX|BUG)[:\s]*(.+)", re.IGNORECASE)
+
+
+def _todo_matches_from_text(text: str) -> List[Tuple[int, str, str]]:
+    matches = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        m = TODO_RE.search(line)
+        if m:
+            matches.append((i, m.group(1).upper(), m.group(2).strip()))
+    return matches
+
+
+def _todo_matches_from_python(text: str) -> List[Tuple[int, str, str]]:
+    matches = []
+    try:
+        tokens = tokenize.generate_tokens(StringIO(text).readline)
+        for tok in tokens:
+            if tok.type != tokenize.COMMENT:
+                continue
+            m = TODO_RE.search(tok.string)
+            if m:
+                matches.append((tok.start[0], m.group(1).upper(), m.group(2).strip()))
+    except tokenize.TokenError:
+        return _todo_matches_from_text(text)
+    return matches
+
+
+def _todo_matches_for_file(rel_path: str, text: str) -> List[Tuple[int, str, str]]:
+    if rel_path.endswith(".py"):
+        return _todo_matches_from_python(text)
+    return _todo_matches_from_text(text)
 
 
 def analyze_todos_without_plan(
@@ -336,23 +467,19 @@ def analyze_todos_without_plan(
     plan_keywords = _extract_drift_keywords(plan_text)
 
     for rel_path in changed_files:
+        if _is_test_path(rel_path):
+            continue
         abs_path = os.path.join(root, rel_path)
         if not os.path.exists(abs_path):
             continue
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+                text = f.read()
         except OSError:
             continue
 
-        for i, line in enumerate(lines, start=1):
-            m = TODO_RE.search(line)
-            if not m:
-                continue
-            marker = m.group(1).upper()
-            text = m.group(2).strip()
-
-            todo_keywords = _extract_drift_keywords(text)
+        for i, marker, todo_text in _todo_matches_for_file(rel_path, text):
+            todo_keywords = _extract_drift_keywords(todo_text)
             # If the TODO's topic matches an active plan, that's fine.
             # If not, it's a marker without a plan to come back to it.
             if plan_keywords and (todo_keywords & plan_keywords):
@@ -363,7 +490,7 @@ def analyze_todos_without_plan(
                 kind="todo_without_plan",
                 severity=severity,
                 message=(
-                    f"{marker} added without matching active plan: '{text}'. "
+                    f"{marker} added without matching active plan: '{todo_text}'. "
                     f"Either create a plan for this or it'll be forgotten."
                 ),
                 file_path=rel_path,
@@ -383,6 +510,17 @@ def analyze_todos_without_plan(
 
 # For the MVP, we just note functions that share a signature_hash with an
 # existing function — i.e., you wrote another "shape" that already exists.
+def _is_method(fn: Function) -> bool:
+    return len(fn.qualified_name.split(".")) >= 3
+
+
+def _is_cross_class_method_family(fn: Function, siblings: List[Function]) -> bool:
+    if not siblings or not all(_is_method(s) for s in siblings):
+        return False
+    owner_classes = {".".join(s.qualified_name.split(".")[:-1]) for s in siblings}
+    return len(owner_classes) >= 2 and all(s.name == fn.name for s in siblings)
+
+
 def analyze_new_pattern(
     store: Store, root: str, changed_files: List[str]
 ) -> List[Observation]:
@@ -401,6 +539,8 @@ def analyze_new_pattern(
                 continue
             siblings = store.functions_by_signature(fn.signature_hash)
             if len(siblings) <= 1:
+                continue
+            if _is_cross_class_method_family(fn, siblings):
                 continue
             # Only flag if THIS function is new (first_seen recent) and others are older
             # (heuristic: this is hard without history; just flag if >2 siblings)

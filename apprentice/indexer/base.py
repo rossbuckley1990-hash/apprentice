@@ -9,8 +9,8 @@ To add a new language:
   2. Register it in registry.py
   3. Add tests
 
-Python is fully implemented. JavaScript/TypeScript stubs are provided
-(regex-based, less accurate than AST but functional).
+Python is fully implemented. JavaScript/TypeScript support is lightweight,
+dependency-free, and less accurate than a full AST.
 """
 
 from __future__ import annotations

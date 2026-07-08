@@ -196,55 +196,19 @@ def cmd_plan(args):
 def cmd_watch(args):
     root, store, config = get_store_and_config()
 
-    if args.staged:
-        # Git hook mode: only check staged files
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
-            capture_output=True, text=True, cwd=root,
-        )
-        staged = [f for f in result.stdout.strip().split("\n") if f and f.endswith((".py", ".js", ".ts", ".jsx", ".tsx"))]
-        if not staged:
-            print("  No staged files to analyze.")
-            return
-        changed = staged
-    elif args.all:
-        changed = discover_all_files(root, config)
-    else:
-        changed = changed_files_since_last_index(store, root, config)
-
-    if not changed:
-        print("  No changes since last index. Use --all to analyze everything.")
+    changed = _watch_changed_files(args, root, store, config)
+    if changed is None:
         return
 
     print(f"  Analyzing {len(changed)} changed files...")
     index_repo(root, store, verbose=False, config=config)
+    _refresh_embeddings(store, root, config)
 
-    # Refresh embeddings for changed files so `similar` stays current
-    from ..indexer.embedder import Embedder
-    embedder = Embedder(backend=config.embedding_backend)
-    # Only re-embed functions in changed files
-    for rel_path in changed:
-        for fn in store.functions_in_file(rel_path):
-            existing = store.get_embedding(fn.qualified_name)
-            if existing is None or existing[1] != embedder.backend:
-                # Needs embedding
-                pass
-    # Bulk re-embed (cheap with TF-IDF)
-    embedder.index_all(store, root)
-
-    observations = run_all_analyzers(store, root, changed, config=config)
-
-    # Add observations (dedup via deterministic IDs — already-acked ones
-    # are preserved by add_observation)
+    observations = _watch_observations(store, root, changed, args, config)
     for obs in observations:
         store.add_observation(obs)
 
-    # Only show NEW (unacknowledged) observations to the user
-    new_obs_ids = {o.id for o in observations}
-    unacked = store.unacknowledged_observations(limit=500)
-    new_unacked = [o for o in unacked if o.id in new_obs_ids]
-
+    new_unacked = _new_unacked_observations(store, observations)
     store.log_snapshot(
         files_checked=len(changed),
         observations_emitted=len(new_unacked),
@@ -257,10 +221,7 @@ def cmd_watch(args):
             sys.exit(0)
         return
 
-    print()
-    print(f"  {len(new_unacked)} new observation(s):")
-    print()
-    print(output.format_observations(new_unacked, use_color=config.color))
+    _print_watch_observations(new_unacked, args, config)
 
     # In staged mode, use exit codes for the git hook:
     #   0 = no blocking, 1 = error-severity found, 2 = crash
@@ -270,6 +231,60 @@ def cmd_watch(args):
             print(f"severity: error ({len(errors)} found)")
             sys.exit(1)
         sys.exit(0)
+
+
+def _watch_changed_files(args, root: str, store: Store, config) -> Optional[List[str]]:
+    if args.staged:
+        # Git hook mode: only check staged files
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+            capture_output=True, text=True, cwd=root,
+        )
+        staged = [f for f in result.stdout.strip().split("\n") if f and f.endswith((".py", ".js", ".ts", ".jsx", ".tsx"))]
+        if not staged:
+            print("  No staged files to analyze.")
+            return None
+        return staged
+    changed = discover_all_files(root, config) if args.all else changed_files_since_last_index(store, root, config)
+
+    if not changed:
+        print("  No changes since last index. Use --all to analyze everything.")
+        return None
+    return changed
+
+
+def _refresh_embeddings(store: Store, root: str, config) -> None:
+    from ..indexer.embedder import Embedder
+    embedder = Embedder(backend=config.embedding_backend)
+    embedder.index_all(store, root)
+
+
+def _watch_observations(store: Store, root: str, changed: List[str], args, config) -> List[Observation]:
+    observations = run_all_analyzers(store, root, changed, config=config)
+    if args.all:
+        # Plan drift is change-window analysis. In full audit mode it becomes a
+        # noisy restatement that the whole repo is broader than the current plan.
+        observations = [o for o in observations if o.kind != "drift"]
+    return observations
+
+
+def _new_unacked_observations(store: Store, observations: List[Observation]) -> List[Observation]:
+    # Only show NEW (unacknowledged) observations to the user
+    new_obs_ids = {o.id for o in observations}
+    unacked = store.unacknowledged_observations(limit=500)
+    return output.sort_observations([o for o in unacked if o.id in new_obs_ids])
+
+
+def _print_watch_observations(obs_list: List[Observation], args, config) -> None:
+    print()
+    print(f"  {len(obs_list)} new observation(s):")
+    print(output.format_observation_summary(obs_list, use_color=config.color))
+    print()
+    max_items = args.limit
+    if max_items is None and args.all:
+        max_items = 20
+    print(output.format_observations(obs_list, use_color=config.color, max_items=max_items))
 
 
 def cmd_observations(args):
@@ -576,6 +591,16 @@ def _print_observations(obs_list: List[Observation], config):
     print(output.format_observations(obs_list, use_color=config.color))
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 # =============================================================================
 # Parser
 # =============================================================================
@@ -608,6 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch = sub.add_parser("watch", help="Run proactive analyzers")
     p_watch.add_argument("--all", action="store_true")
     p_watch.add_argument("--staged", action="store_true", help="Only check git-staged files")
+    p_watch.add_argument("--limit", type=_non_negative_int, help="Maximum observations to display")
     p_watch.set_defaults(func=cmd_watch)
 
     p_obs = sub.add_parser("observations", help="Show observations")

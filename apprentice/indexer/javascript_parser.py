@@ -1,52 +1,63 @@
 """
 JavaScript/TypeScript parser.
 
-Uses regex-based extraction (not a full AST) for the MVP. This is less
-accurate than the Python AST parser but functional — it finds function
-declarations, arrow functions, and class definitions.
-
-For production use, replace with a tree-sitter-based parser.
+This is intentionally lightweight and dependency-free, but it is not a plain
+regex parser: source is first masked so strings and comments cannot confuse
+brace matching or function-boundary detection.
 """
 
 from __future__ import annotations
-import re
 import os
-import hashlib
-from typing import List, Tuple
+import re
+from typing import List, Optional, Tuple
 
 from ..model.entities import File, Function, Class, hash_content
 
 
-# Regex patterns for JS/TS function detection
-# Matches: function foo(a, b) { ... }
+IDENT = r"[A-Za-z_$][\w$]*"
+CONTROL_WORDS = {
+    "if", "for", "while", "switch", "catch", "function", "return", "typeof",
+    "new", "class", "import", "export", "await", "async", "super",
+}
+
 FUNCTION_RE = re.compile(
-    r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)\s*\{",
+    rf"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s+"
+    rf"(?P<name>{IDENT})(?:\s*<[^>{{}}()]*>)?\s*"
+    rf"\((?P<args>[^()]*)\)\s*(?::\s*[^{{;]+)?\s*\{{",
     re.MULTILINE,
 )
-# Matches: const foo = (a, b) => { ... } and const foo = function(a, b) { ... }
+FUNCTION_EXPR_RE = re.compile(
+    rf"(?:export\s+)?(?:const|let|var)\s+(?P<name>{IDENT})"
+    rf"(?:\s*:\s*[^=\n;]+)?\s*=\s*(?:async\s+)?function"
+    rf"(?:\s+{IDENT})?(?:\s*<[^>{{}}()]*>)?\s*"
+    rf"\((?P<args>[^()]*)\)\s*(?::\s*[^{{;]+)?\s*\{{",
+    re.MULTILINE,
+)
 ARROW_FUNCTION_RE = re.compile(
-    r"(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>\s*(?:\{|=>)",
+    rf"(?:export\s+)?(?:const|let|var)\s+(?P<name>{IDENT})"
+    rf"(?:\s*:\s*[^=\n;]+)?\s*=\s*(?:async\s*)?(?:<[^>{{}}()]*>\s*)?"
+    rf"(?P<args>\([^()]*\)|{IDENT}(?:\s*:\s*[^=;,\n]+)?)\s*"
+    rf"(?::\s*[^=;{{]+)?=>",
     re.MULTILINE,
 )
-# Matches: class Foo extends Bar { ... }
 CLASS_RE = re.compile(
-    r"(?:export\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?\s*\{",
+    rf"(?:export\s+)?(?:default\s+)?class\s+(?P<name>{IDENT})"
+    rf"(?:\s+extends\s+(?P<base>{IDENT}))?\s*\{{",
     re.MULTILINE,
 )
-# Matches: method(a, b) { ... } inside classes
 METHOD_RE = re.compile(
-    r"(?:async\s+)?(\w+)\s*\(([^)]*)\)\s*\{",
+    rf"(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*"
+    rf"(?P<name>{IDENT})(?:\s*<[^>{{}}()]*>)?\s*"
+    rf"\((?P<args>[^()]*)\)\s*(?::\s*[^{{;]+)?\s*\{{",
     re.MULTILINE,
 )
-# Rough complexity: count if/for/while/switch/case/&&/||/?/
-BRANCH_RE = re.compile(
-    r"\b(?:if|for|while|switch|case|catch)\b|&&|\|\||\?[^.:]",
-    re.MULTILINE,
-)
+BRANCH_RE = re.compile(r"\b(?:if|for|while|switch|case|catch)\b|&&|\|\||\?[^.:]")
+DIRECT_CALL_RE = re.compile(rf"(?<![\w$.])({IDENT})\s*\(")
+METHOD_CALL_RE = re.compile(rf"\.\s*({IDENT})\s*\(")
 
 
 class JavaScriptParser:
-    """Regex-based JS/TS parser. Implements the LanguageParser interface."""
+    """Lightweight JS/TS parser. Implements the LanguageParser interface."""
 
     @property
     def language_name(self) -> str:
@@ -60,108 +71,117 @@ class JavaScriptParser:
         rel_path = os.path.relpath(file_path, root)
         content_hash = hash_content(content)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        lang = "typescript" if file_path.endswith((".ts", ".tsx")) else "javascript"
+        module_qname = self._module_qname(rel_path)
+        masked = self._mask_non_code(content)
 
         functions: List[Function] = []
         classes: List[Class] = []
         function_names: List[str] = []
         class_names: List[str] = []
 
-        # Determine if it's TypeScript
-        lang = "typescript" if file_path.endswith((".ts", ".tsx")) else "javascript"
+        for m in CLASS_RE.finditer(masked):
+            open_pos = m.end() - 1
+            close_end = self._find_matching_brace_end(masked, open_pos + 1)
+            if close_end <= open_pos + 1:
+                continue
+            class_name = m.group("name")
+            base = m.group("base") or ""
+            class_is_exported = self._is_exported(masked, m.start(), m.end())
+            class_names.append(class_name)
 
-        # Build module qualified-name
-        rel_norm = rel_path.replace(os.sep, ".")
-        for ext in self.file_extensions:
-            if rel_norm.endswith(ext):
-                rel_norm = rel_norm[: -len(ext)]
-                break
-        module_qname = rel_norm
-
-        # Find regular functions
-        for m in FUNCTION_RE.finditer(content):
-            name = m.group(1)
-            args_str = m.group(2).strip()
-            arg_names = [a.strip().split(":")[0].split("=")[0].strip() for a in args_str.split(",") if a.strip()]
-            start_line = content[: m.start()].count("\n") + 1
-            brace_end_offset = self._find_matching_brace_end(content, m.end())
-            end_line = self._offset_to_line(content, brace_end_offset) if brace_end_offset > m.end() else start_line
-
-            body = content[m.end():brace_end_offset] if brace_end_offset > m.end() else ""
-            body_hash = hash_content(body)
-            sig_hash = hash_content(f"{name}({','.join(arg_names)})")
-            complexity = 1 + len(BRANCH_RE.findall(body))
-            summary = self._make_summary(body)
-
-            function_names.append(name)
-            functions.append(Function(
-                name=name,
-                qualified_name=f"{module_qname}.{name}",
-                file_path=rel_path,
-                start_line=start_line,
-                end_line=end_line,
-                arg_names=arg_names,
-                signature_hash=sig_hash,
-                body_hash=body_hash,
-                ast_summary=summary,
-                complexity=complexity,
-                docstring=None,
-                calls=[],
-            ))
-
-        # Find arrow functions
-        for m in ARROW_FUNCTION_RE.finditer(content):
-            name = m.group(1)
-            args_str = m.group(2).strip()
-            arg_names = [a.strip().split(":")[0].split("=")[0].strip() for a in args_str.split(",") if a.strip()]
-            start_line = content[: m.start()].count("\n") + 1
-            brace_end_offset = self._find_matching_brace_end(content, m.end())
-            end_line = self._offset_to_line(content, brace_end_offset) if brace_end_offset > m.end() else start_line
-
-            body = content[m.end():brace_end_offset] if brace_end_offset > m.end() else ""
-            body_hash = hash_content(body)
-            sig_hash = hash_content(f"{name}({','.join(arg_names)})")
-            complexity = 1 + len(BRANCH_RE.findall(body))
-            summary = self._make_summary(body)
-
-            function_names.append(name)
-            functions.append(Function(
-                name=name,
-                qualified_name=f"{module_qname}.{name}",
-                file_path=rel_path,
-                start_line=start_line,
-                end_line=end_line,
-                arg_names=arg_names,
-                signature_hash=sig_hash,
-                body_hash=body_hash,
-                ast_summary=summary,
-                complexity=complexity,
-                docstring=None,
-                calls=[],
-            ))
-
-        # Find classes
-        for m in CLASS_RE.finditer(content):
-            name = m.group(1)
-            base = m.group(2) if m.group(2) else ""
-            start_line = content[: m.start()].count("\n") + 1
-            end_line = self._find_matching_brace_end(content, m.end()) or start_line
-
-            # Find methods within the class
-            class_body = content[m.end():end_line] if end_line > m.end() else ""
+            body_start = open_pos + 1
+            body_end = close_end - 1
             method_names = []
-            for mm in METHOD_RE.finditer(class_body):
-                method_names.append(mm.group(1))
+            for mm in METHOD_RE.finditer(masked, body_start, body_end):
+                if self._brace_depth(masked, body_start, mm.start()) != 0:
+                    continue
+                method_name = mm.group("name")
+                if method_name in CONTROL_WORDS:
+                    continue
+                method_names.append(method_name)
+                method_open = mm.end() - 1
+                method_close_end = self._find_matching_brace_end(masked, method_open + 1)
+                if method_close_end <= method_open + 1:
+                    continue
+                if method_name != "constructor":
+                    fn = self._make_function(
+                        name=method_name,
+                        qualified_name=f"{module_qname}.{class_name}.{method_name}",
+                        file_path=rel_path,
+                        start=mm.start(),
+                        args=mm.group("args"),
+                        body_start=method_open + 1,
+                        body_end=method_close_end - 1,
+                        content=content,
+                        masked=masked,
+                    )
+                    if class_is_exported:
+                        fn.calls.append(f"live:{fn.qualified_name}:export")
+                    functions.append(fn)
+                    function_names.append(method_name)
 
-            class_names.append(name)
             classes.append(Class(
-                name=name,
-                qualified_name=f"{module_qname}.{name}",
+                name=class_name,
+                qualified_name=f"{module_qname}.{class_name}",
                 file_path=rel_path,
-                start_line=start_line,
-                end_line=end_line,
+                start_line=self._offset_to_line(content, m.start()),
+                end_line=self._offset_to_line(content, close_end),
                 bases=[base] if base else [],
                 method_names=method_names,
             ))
+
+        for pattern in (FUNCTION_RE, FUNCTION_EXPR_RE):
+            for m in pattern.finditer(masked):
+                open_pos = m.end() - 1
+                close_end = self._find_matching_brace_end(masked, open_pos + 1)
+                if close_end <= open_pos + 1:
+                    continue
+                fn = self._make_function(
+                    name=m.group("name"),
+                    qualified_name=f"{module_qname}.{m.group('name')}",
+                    file_path=rel_path,
+                    start=m.start(),
+                    args=m.group("args"),
+                    body_start=open_pos + 1,
+                    body_end=close_end - 1,
+                    content=content,
+                    masked=masked,
+                )
+                if self._is_exported(masked, m.start(), m.end()):
+                    fn.calls.append(f"live:{fn.qualified_name}:export")
+                functions.append(fn)
+                function_names.append(m.group("name"))
+
+        for m in ARROW_FUNCTION_RE.finditer(masked):
+            body_start = self._skip_ws(masked, m.end())
+            if body_start >= len(masked):
+                continue
+            if masked[body_start] == "{":
+                close_end = self._find_matching_brace_end(masked, body_start + 1)
+                if close_end <= body_start + 1:
+                    continue
+                body_end = close_end - 1
+            else:
+                body_end = self._find_expression_end(masked, body_start)
+            fn = self._make_function(
+                name=m.group("name"),
+                qualified_name=f"{module_qname}.{m.group('name')}",
+                file_path=rel_path,
+                start=m.start(),
+                args=m.group("args"),
+                body_start=body_start,
+                body_end=body_end,
+                content=content,
+                masked=masked,
+            )
+            if self._is_exported(masked, m.start(), m.end()):
+                fn.calls.append(f"live:{fn.qualified_name}:export")
+            functions.append(fn)
+            function_names.append(m.group("name"))
+
+        functions = self._dedupe_functions(functions)
+        function_names = [f.name for f in functions]
 
         file_entity = File(
             path=rel_path,
@@ -173,9 +193,168 @@ class JavaScriptParser:
         )
         return file_entity, functions, classes
 
+    def _make_function(
+        self,
+        name: str,
+        qualified_name: str,
+        file_path: str,
+        start: int,
+        args: str,
+        body_start: int,
+        body_end: int,
+        content: str,
+        masked: str,
+    ) -> Function:
+        body = content[body_start:body_end]
+        masked_body = masked[body_start:body_end]
+        arg_names = self._parse_args(args)
+        return Function(
+            name=name,
+            qualified_name=qualified_name,
+            file_path=file_path,
+            start_line=self._offset_to_line(content, start),
+            end_line=self._offset_to_line(content, body_end),
+            arg_names=arg_names,
+            signature_hash=hash_content(f"{name}({','.join(arg_names)})"),
+            body_hash=hash_content(body.strip()),
+            ast_summary=self._make_summary(masked_body),
+            complexity=1 + len(BRANCH_RE.findall(masked_body)),
+            docstring=None,
+            calls=self._collect_calls(masked_body),
+        )
+
+    def _module_qname(self, rel_path: str) -> str:
+        rel_norm = rel_path.replace(os.sep, ".")
+        for ext in self.file_extensions:
+            if rel_norm.endswith(ext):
+                return rel_norm[: -len(ext)]
+        return rel_norm
+
+    def _is_exported(self, masked: str, start: int, end: int) -> bool:
+        return masked[start:end].lstrip().startswith("export ")
+
+    def _parse_args(self, args: str) -> List[str]:
+        args = args.strip()
+        if args.startswith("(") and args.endswith(")"):
+            args = args[1:-1]
+        names = []
+        for part in self._split_args(args):
+            part = part.strip()
+            if not part or part == "void":
+                continue
+            part = part.split("=", 1)[0].strip()
+            part = part.removeprefix("...")
+            if part.startswith("{") or part.startswith("["):
+                names.append("destructured")
+                continue
+            part = part.split(":", 1)[0].strip().rstrip("?")
+            if part and re.match(rf"^{IDENT}$", part):
+                names.append(part)
+        return names
+
+    def _split_args(self, args: str) -> List[str]:
+        parts = []
+        start = 0
+        depth = 0
+        for i, ch in enumerate(args):
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                parts.append(args[start:i])
+                start = i + 1
+        if args[start:].strip():
+            parts.append(args[start:])
+        return parts
+
+    def _collect_calls(self, masked_body: str) -> List[str]:
+        calls = []
+        seen = set()
+        for m in METHOD_CALL_RE.finditer(masked_body):
+            name = m.group(1)
+            key = f"call:.{name}"
+            if key not in seen:
+                seen.add(key)
+                calls.append(key)
+        for m in DIRECT_CALL_RE.finditer(masked_body):
+            name = m.group(1)
+            if name in CONTROL_WORDS:
+                continue
+            key = f"call:{name}"
+            if key not in seen:
+                seen.add(key)
+                calls.append(key)
+        return calls
+
+    def _dedupe_functions(self, functions: List[Function]) -> List[Function]:
+        by_key = {}
+        for fn in sorted(functions, key=lambda f: (f.file_path, f.start_line, f.end_line, f.qualified_name)):
+            by_key.setdefault((fn.qualified_name, fn.start_line), fn)
+        return list(by_key.values())
+
+    def _mask_non_code(self, content: str) -> str:
+        chars = list(content)
+        state = "code"
+        i = 0
+        while i < len(chars):
+            ch = chars[i]
+            nxt = chars[i + 1] if i + 1 < len(chars) else ""
+            if state == "code":
+                if ch == "/" and nxt == "/":
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    state = "line_comment"
+                    continue
+                if ch == "/" and nxt == "*":
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    state = "block_comment"
+                    continue
+                if ch in ("'", '"', "`"):
+                    quote = ch
+                    chars[i] = " "
+                    i += 1
+                    state = quote
+                    continue
+            elif state == "line_comment":
+                if ch == "\n":
+                    state = "code"
+                else:
+                    chars[i] = " "
+            elif state == "block_comment":
+                if ch == "*" and nxt == "/":
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    state = "code"
+                    continue
+                if ch != "\n":
+                    chars[i] = " "
+            else:
+                quote = state
+                if ch == "\\":
+                    chars[i] = " "
+                    if i + 1 < len(chars) and chars[i + 1] != "\n":
+                        chars[i + 1] = " "
+                    i += 2
+                    continue
+                if ch == quote:
+                    chars[i] = " "
+                    state = "code"
+                elif ch != "\n":
+                    chars[i] = " "
+            i += 1
+        return "".join(chars)
+
     def _find_matching_brace_end(self, content: str, start: int) -> int:
-        """Find the character offset of the matching closing brace.
-        Returns the offset AFTER the closing brace, or `start` if no match."""
+        """Find the offset after the matching closing brace.
+
+        `start` is the offset immediately after the opening brace, matching the
+        original public helper's calling convention.
+        """
+        open_pos = start - 1
+        if open_pos < 0 or open_pos >= len(content) or content[open_pos] != "{":
+            return start
         depth = 1
         i = start
         while i < len(content) and depth > 0:
@@ -184,22 +363,51 @@ class JavaScriptParser:
             elif content[i] == "}":
                 depth -= 1
             i += 1
-        if depth == 0:
-            return i  # character offset after the closing brace
-        return start  # no match found
+        return i if depth == 0 else start
+
+    def _brace_depth(self, masked: str, start: int, end: int) -> int:
+        depth = 0
+        for ch in masked[start:end]:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth = max(0, depth - 1)
+        return depth
+
+    def _skip_ws(self, text: str, pos: int) -> int:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        return pos
+
+    def _find_expression_end(self, masked: str, start: int) -> int:
+        depth = 0
+        i = start
+        while i < len(masked):
+            ch = masked[i]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and ch in ";\n":
+                break
+            i += 1
+        return i
 
     def _offset_to_line(self, content: str, offset: int) -> int:
-        """Convert a character offset to a line number."""
         return content[:offset].count("\n") + 1
 
-    def _make_summary(self, body: str) -> str:
-        """Make a rough AST summary from function body."""
+    def _make_summary(self, masked_body: str) -> str:
         calls = []
-        for m in re.finditer(r"(\w+)\s*\(", body):
-            calls.append(m.group(1))
-        returns = body.count("return ")
-        ifs = len(re.findall(r"\bif\b", body))
-        loops = len(re.findall(r"\b(?:for|while)\b", body))
+        for call_desc in self._collect_calls(masked_body):
+            if call_desc.startswith("call:."):
+                calls.append(call_desc[len("call:."):])
+            elif call_desc.startswith("call:"):
+                calls.append(call_desc[len("call:"):])
+        returns = len(re.findall(r"\breturn\b", masked_body))
+        ifs = len(re.findall(r"\bif\b", masked_body))
+        loops = len(re.findall(r"\b(?:for|while)\b", masked_body))
 
         parts = []
         if calls:
@@ -214,5 +422,4 @@ class JavaScriptParser:
         return "; ".join(parts) if parts else "no-op"
 
     def should_ignore(self, rel_path: str) -> bool:
-        # Skip minified files
         return ".min." in rel_path
