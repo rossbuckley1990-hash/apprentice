@@ -321,6 +321,7 @@ def _build_call_indexes(functions: List[Function]) -> Dict[str, Dict[str, List[s
     name_to_qualified: Dict[str, List[str]] = {}
     method_to_qualified: Dict[str, List[str]] = {}
     class_methods: Dict[str, List[str]] = {}
+    class_name_to_methods: Dict[str, List[str]] = {}
     for fn in functions:
         name_to_qualified.setdefault(fn.name, []).append(fn.qualified_name)
         parts = fn.qualified_name.split(".")
@@ -328,10 +329,12 @@ def _build_call_indexes(functions: List[Function]) -> Dict[str, Dict[str, List[s
             method_to_qualified.setdefault(fn.name, []).append(fn.qualified_name)
             class_full_qname = ".".join(parts[:-1])
             class_methods.setdefault(class_full_qname, []).append(fn.qualified_name)
+            class_name_to_methods.setdefault(parts[-2], []).append(fn.qualified_name)
     return {
         "name_to_qualified": name_to_qualified,
         "method_to_qualified": method_to_qualified,
         "class_methods": class_methods,
+        "class_name_to_methods": class_name_to_methods,
     }
 
 
@@ -416,9 +419,15 @@ def _add_module_ref(
 ) -> bool:
     if not call_desc.startswith("module_ref:"):
         return False
-    for target in _resolve_name(call_desc[len("module_ref:"):], indexes, callers):
+    name_part = call_desc[len("module_ref:"):]
+    for target in _resolve_name(name_part, indexes, callers):
         if target in callers:
             callers[target].append("<module>")
+    if not name_part.startswith("."):
+        class_name = name_part.split(".")[-1]
+        for method_qname in indexes["class_name_to_methods"].get(class_name, []):
+            if method_qname in callers:
+                callers[method_qname].append(f"<class:{class_name}>")
     return True
 
 

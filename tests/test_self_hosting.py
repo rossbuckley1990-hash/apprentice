@@ -78,6 +78,28 @@ class TestSelfHosting:
             f"This is called from _handle_func in the indexer."
         )
 
+    def test_registered_parser_methods_not_dead(self, self_indexed):
+        """Parser instances are registered and called through the registry.
+        Dynamic dispatch should not make their public methods look removable."""
+        store = self_indexed
+        for qname in [
+            "apprentice.indexer.python_parser.PythonParser.parse_file",
+            "apprentice.indexer.python_parser.PythonParser.file_extensions",
+            "apprentice.indexer.javascript_parser.JavaScriptParser.parse_file",
+            "apprentice.indexer.javascript_parser.JavaScriptParser.file_extensions",
+        ]:
+            fn = store.get_function(qname)
+            assert fn is not None, f"{qname} not found"
+            assert not fn.is_dead, f"{qname} was flagged as dead; callers={fn.callers}"
+
+    def test_self_watch_has_no_error_observations(self, self_indexed):
+        store = self_indexed
+        root = str(REPO_ROOT)
+        all_files = [f.path for f in store.all_files()]
+        obs = run_all_analyzers(store, root, all_files)
+        errors = [o for o in obs if o.severity == "error"]
+        assert errors == []
+
     def test_ast_summary_not_corrupted(self, self_indexed):
         """Verify that _ast_summary is computed on the UNCORRUPTED AST
         (the old bug mutated the AST before computing the summary)."""

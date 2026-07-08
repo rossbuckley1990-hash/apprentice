@@ -242,6 +242,31 @@ class TestIndexer:
         assert fn.is_dead is False
         assert "<module>" in fn.callers
 
+    def test_module_registered_class_methods_are_live(self, tmp_repo):
+        write_file(tmp_repo, "registry.py", """
+            PARSERS = []
+
+            class PythonParser:
+                def language_name(self):
+                    return "python"
+                def parse_file(self, path):
+                    return path
+
+            def register_parser(parser):
+                PARSERS.append(parser)
+
+            register_parser(PythonParser())
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        parse_file = store.get_function("registry.PythonParser.parse_file")
+        language_name = store.get_function("registry.PythonParser.language_name")
+        assert parse_file is not None
+        assert language_name is not None
+        assert parse_file.is_dead is False
+        assert language_name.is_dead is False
+        assert "<class:PythonParser>" in parse_file.callers
+
 
 # =============================================================================
 # Embedder tests
@@ -388,6 +413,61 @@ class TestProactive:
         store.upsert_plan(plan)
         obs = analyze_todos_without_plan(store, tmp_repo, ["todo.py"])
         assert len(obs) == 0  # plan matches
+
+    def test_python_todo_scanner_ignores_string_literals(self, tmp_repo):
+        write_file(tmp_repo, "strings.py", '''
+            def fixture():
+                return """
+                # TODO: this is test fixture text, not a real comment
+                """
+
+            def real_marker():
+                # TODO: wire this to the queue
+                return None
+        ''')
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        obs = analyze_todos_without_plan(store, tmp_repo, ["strings.py"])
+        assert len(obs) == 1
+        assert "wire this to the queue" in obs[0].message
+
+    def test_dead_code_skips_abstract_interface_methods(self, tmp_repo):
+        write_file(tmp_repo, "interfaces.py", """
+            from abc import ABC, abstractmethod
+
+            class Parser(ABC):
+                @abstractmethod
+                def parse_file(self, path):
+                    raise NotImplementedError
+
+                def should_ignore(self, path):
+                    return False
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        obs = analyze_dead_code(store, tmp_repo, ["interfaces.py"])
+        qnames = {o.function_qualified_name for o in obs}
+        assert "interfaces.Parser.parse_file" not in qnames
+        assert "interfaces.Parser.should_ignore" not in qnames
+
+    def test_new_pattern_skips_cross_class_interface_methods(self, tmp_repo):
+        write_file(tmp_repo, "parsers.py", """
+            class BaseParser:
+                def parse_file(self, path):
+                    raise NotImplementedError
+
+            class PythonParser:
+                def parse_file(self, path):
+                    return path
+
+            class JavaScriptParser:
+                def parse_file(self, path):
+                    return path
+        """)
+        store = init_store(tmp_repo)
+        index_repo(tmp_repo, store, verbose=False)
+        obs = analyze_new_pattern(store, tmp_repo, ["parsers.py"])
+        assert not [o for o in obs if o.kind == "new_pattern"]
 
     def test_full_watch_pipeline(self, tmp_repo):
         """End-to-end: index, plan, change, watch, get observations."""

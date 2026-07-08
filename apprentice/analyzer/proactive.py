@@ -13,7 +13,9 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import tokenize
 from datetime import datetime, timezone
+from io import StringIO
 from typing import List, Optional, Set, Dict, Tuple
 
 from ..model.entities import (
@@ -232,6 +234,18 @@ def analyze_duplication(
 
 ENTRY_POINT_NAMES = {"main", "__main__", "run", "app", "create_app", "wsgi", "asgi"}
 TEST_PREFIXES = ("test_", "Test")
+PUBLIC_API_DECORATORS = {"<decorator>", "<export>"}
+ABSTRACT_BASE_NAMES = {"ABC", "Protocol"}
+
+
+def _abstract_method_qnames(store: Store) -> Set[str]:
+    methods = set()
+    for cls in store.all_classes():
+        if not (set(cls.bases) & ABSTRACT_BASE_NAMES):
+            continue
+        for method_name in cls.method_names:
+            methods.add(f"{cls.qualified_name}.{method_name}")
+    return methods
 
 
 def analyze_dead_code(
@@ -245,6 +259,7 @@ def analyze_dead_code(
     changed_fns: List[Function] = []
     for rel_path in changed_files:
         changed_fns.extend(store.functions_in_file(rel_path))
+    abstract_methods = _abstract_method_qnames(store)
 
     for fn in changed_fns:
         if not fn.is_dead:
@@ -254,6 +269,10 @@ def analyze_dead_code(
         if fn.name.startswith(TEST_PREFIXES):
             continue
         if fn.name.startswith("__") and fn.name.endswith("__"):
+            continue
+        if any(caller in PUBLIC_API_DECORATORS for caller in fn.callers):
+            continue
+        if fn.qualified_name in abstract_methods:
             continue
         # Don't re-flag the same dead function we already noted
         obs.append(_obs(
@@ -320,7 +339,37 @@ def analyze_complexity(
 # Analyzer 5: TODO/FIXME without a plan entry
 # =============================================================================
 
-TODO_RE = re.compile(r"#\s*(TODO|FIXME|HACK|XXX|BUG)[:\s]*(.+)", re.IGNORECASE)
+TODO_RE = re.compile(r"(?:#|//)\s*(TODO|FIXME|HACK|XXX|BUG)[:\s]*(.+)", re.IGNORECASE)
+
+
+def _todo_matches_from_text(text: str) -> List[Tuple[int, str, str]]:
+    matches = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        m = TODO_RE.search(line)
+        if m:
+            matches.append((i, m.group(1).upper(), m.group(2).strip()))
+    return matches
+
+
+def _todo_matches_from_python(text: str) -> List[Tuple[int, str, str]]:
+    matches = []
+    try:
+        tokens = tokenize.generate_tokens(StringIO(text).readline)
+        for tok in tokens:
+            if tok.type != tokenize.COMMENT:
+                continue
+            m = TODO_RE.search(tok.string)
+            if m:
+                matches.append((tok.start[0], m.group(1).upper(), m.group(2).strip()))
+    except tokenize.TokenError:
+        return _todo_matches_from_text(text)
+    return matches
+
+
+def _todo_matches_for_file(rel_path: str, text: str) -> List[Tuple[int, str, str]]:
+    if rel_path.endswith(".py"):
+        return _todo_matches_from_python(text)
+    return _todo_matches_from_text(text)
 
 
 def analyze_todos_without_plan(
@@ -341,18 +390,12 @@ def analyze_todos_without_plan(
             continue
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+                text = f.read()
         except OSError:
             continue
 
-        for i, line in enumerate(lines, start=1):
-            m = TODO_RE.search(line)
-            if not m:
-                continue
-            marker = m.group(1).upper()
-            text = m.group(2).strip()
-
-            todo_keywords = _extract_drift_keywords(text)
+        for i, marker, todo_text in _todo_matches_for_file(rel_path, text):
+            todo_keywords = _extract_drift_keywords(todo_text)
             # If the TODO's topic matches an active plan, that's fine.
             # If not, it's a marker without a plan to come back to it.
             if plan_keywords and (todo_keywords & plan_keywords):
@@ -363,7 +406,7 @@ def analyze_todos_without_plan(
                 kind="todo_without_plan",
                 severity=severity,
                 message=(
-                    f"{marker} added without matching active plan: '{text}'. "
+                    f"{marker} added without matching active plan: '{todo_text}'. "
                     f"Either create a plan for this or it'll be forgotten."
                 ),
                 file_path=rel_path,
@@ -383,6 +426,17 @@ def analyze_todos_without_plan(
 
 # For the MVP, we just note functions that share a signature_hash with an
 # existing function — i.e., you wrote another "shape" that already exists.
+def _is_method(fn: Function) -> bool:
+    return len(fn.qualified_name.split(".")) >= 3
+
+
+def _is_cross_class_method_family(fn: Function, siblings: List[Function]) -> bool:
+    if not siblings or not all(_is_method(s) for s in siblings):
+        return False
+    owner_classes = {".".join(s.qualified_name.split(".")[:-1]) for s in siblings}
+    return len(owner_classes) >= 2 and all(s.name == fn.name for s in siblings)
+
+
 def analyze_new_pattern(
     store: Store, root: str, changed_files: List[str]
 ) -> List[Observation]:
@@ -401,6 +455,8 @@ def analyze_new_pattern(
                 continue
             siblings = store.functions_by_signature(fn.signature_hash)
             if len(siblings) <= 1:
+                continue
+            if _is_cross_class_method_family(fn, siblings):
                 continue
             # Only flag if THIS function is new (first_seen recent) and others are older
             # (heuristic: this is hard without history; just flag if >2 siblings)
